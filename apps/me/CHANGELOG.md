@@ -1,5 +1,42 @@
 # Changelog
 
+## [2.1.3](https://github.com/F3-Nation/f3-nation/compare/me@2.1.2...me@2.1.3) (2026-07-26)
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @acme/api bumped to 0.4.1
+
+## [2.1.2](https://github.com/F3-Nation/f3-nation/compare/me@2.1.1...me@2.1.2) (2026-07-23)
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @acme/api bumped to 0.4.0
+
+## [2.1.1](https://github.com/F3-Nation/f3-nation/compare/me@2.1.0...me@2.1.1) (2026-07-14)
+
+
+### Bug Fixes
+
+* **api,me:** require filters and cap results on me.users ([#662](https://github.com/F3-Nation/f3-nation/issues/662)) ([70375fc](https://github.com/F3-Nation/f3-nation/commit/70375fc0b396b9f8f0aefd74b407a4ba9aae3b7f))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @acme/api bumped to 0.3.1
+    * @acme/shared bumped to 0.1.3
+    * @acme/sso bumped to 0.2.1
+    * @acme/ui bumped to 0.1.3
+  * devDependencies
+    * @acme/tailwind-config bumped to 0.1.3
+
 ## [2.1.0](https://github.com/F3-Nation/f3-nation/compare/me@2.0.5...me@2.1.0) (2026-07-08)
 
 

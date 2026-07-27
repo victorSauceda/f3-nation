@@ -17,6 +17,10 @@
     "SKIP_RESET_TEST_DB",
     "E2E_BASE_URL",
     "E2E_API_URL",
+    "CHAR_TEST_TARGET",
+    "CHAR_TEST_BASE_URL",
+    "CHAR_TEST_SIGNING_JWK",
+    "SUPER_ADMIN_API_KEY",
     "EMAIL_ADMIN_DESTINATIONS",
     "EMAIL_FROM",
     "EMAIL_SERVER",
@@ -88,6 +92,10 @@
     "test": {
       "dependsOn": ["^topo", "reset-test-db", "^reset-test-db"],
       "outputs": ["coverage/**"]
+    },
+    "test:characterization": {
+      "dependsOn": ["^topo", "reset-test-db", "^reset-test-db", "test"],
+      "cache": false
     },
     "clean": {
       "cache": false

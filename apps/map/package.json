@@ -1,11 +1,12 @@
 {
   "name": "f3-map",
-  "version": "7.0.6",
+  "version": "7.0.9",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "pnpm with-env next build",
     "clean": "rm -rf .turbo node_modules .next",
+    "dev:inspect": "NODE_OPTIONS='--inspect' TZ=UTC pnpm with-env next dev",
     "dev": "TZ=UTC pnpm with-env next dev -p 3000",
     "format": "prettier --check . --ignore-path ../../.gitignore --ignore-path ../../.prettierignore",
     "lint": "dotenv -v SKIP_ENV_VALIDATION=1 eslint .",
@@ -22,7 +23,6 @@
     "@acme/auth": "workspace:*",
     "@acme/logger": "workspace:*",
     "@acme/shared": "workspace:*",
-    "@acme/storage": "workspace:*",
     "@acme/tailwind-config": "workspace:*",
     "@acme/ui": "workspace:*",
     "@acme/validators": "workspace:*",
@@ -55,6 +55,7 @@
     "react-responsive": "catalog:",
     "server-only": "catalog:",
     "supercluster": "catalog:",
+    "uuid": "catalog:",
     "zod": "catalog:"
   },
   "devDependencies": {

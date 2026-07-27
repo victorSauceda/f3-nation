@@ -1,5 +1,44 @@
 # Changelog
 
+## [7.0.9](https://github.com/F3-Nation/f3-nation/compare/map@7.0.8...map@7.0.9) (2026-07-26)
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @acme/api bumped to 0.4.1
+    * @acme/auth bumped to 0.1.5
+    * @acme/validators bumped to 0.2.0
+
+## [7.0.8](https://github.com/F3-Nation/f3-nation/compare/map@7.0.7...map@7.0.8) (2026-07-23)
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @acme/api bumped to 0.4.0
+
+## [7.0.7](https://github.com/F3-Nation/f3-nation/compare/map@7.0.6...map@7.0.7) (2026-07-14)
+
+
+### Bug Fixes
+
+* **map,shared:** consolidate search trigger to 3 chars, label panel close button ([#607](https://github.com/F3-Nation/f3-nation/issues/607)) ([f1e7751](https://github.com/F3-Nation/f3-nation/commit/f1e7751cb45c8edf82d3a6673d1d02d0a704409e))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @acme/api bumped to 0.3.1
+    * @acme/auth bumped to 0.1.4
+    * @acme/shared bumped to 0.1.3
+    * @acme/tailwind-config bumped to 0.1.3
+    * @acme/ui bumped to 0.1.3
+    * @acme/validators bumped to 0.1.3
+
 ## [7.0.6](https://github.com/F3-Nation/f3-nation/compare/map@7.0.5...map@7.0.6) (2026-07-08)
 
 
