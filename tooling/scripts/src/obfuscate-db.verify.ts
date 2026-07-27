@@ -333,6 +333,36 @@ async function main(): Promise<void> {
   const envBackup = existsSync(envFile) ? readFileSync(envFile, "utf8") : null;
   writeFileSync(envFile, `DATABASE_URL=${DATABASE_URL}\n`);
 
+  // We overwrite the developer's real packages/env/.env for the child processes.
+  // The finally below restores it on the normal path, but an abrupt SIGINT/
+  // SIGTERM (Ctrl-C) skips finally — restore on those signals too so we never
+  // leave their env file replaced. Idempotent so the finally can also call it.
+  let envRestored = false;
+  const restoreEnv = (): void => {
+    if (envRestored) return;
+    envRestored = true;
+    try {
+      if (envBackup === null) {
+        if (existsSync(envFile)) unlinkSync(envFile);
+      } else {
+        writeFileSync(envFile, envBackup);
+      }
+    } catch {
+      // best effort — nothing actionable if the restore itself fails
+    }
+  };
+  const onSignal = (): void => {
+    restoreEnv();
+    try {
+      stopPostgres();
+    } catch {
+      // best effort
+    }
+    process.exit(130);
+  };
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
+
   const sql = postgres(DATABASE_URL, { max: 1, onnotice: () => undefined });
   try {
     const childEnv = {
@@ -467,11 +497,7 @@ async function main(): Promise<void> {
     if (failed.length > 0) process.exitCode = 1;
   } finally {
     await sql.end();
-    if (envBackup === null) {
-      unlinkSync(envFile);
-    } else {
-      writeFileSync(envFile, envBackup);
-    }
+    restoreEnv();
     stopPostgres();
     console.log("Cleaned up throwaway postgres and packages/env/.env.");
   }

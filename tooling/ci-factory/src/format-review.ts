@@ -29,6 +29,9 @@ export const MAX_JUDGE_FINDINGS = 8;
 const SEVERITIES = new Set<Severity>(["high", "medium", "low"]);
 const TAGS = new Set<FindingTag>(["A", "B", "A+B"]);
 const SEVERITY_RANK: Record<Severity, number> = { high: 0, medium: 1, low: 2 };
+// `A+B` (independent agreement) outranks a single-reviewer finding at equal
+// severity — see judge.system.md §4.
+const TAG_RANK: Record<FindingTag, number> = { "A+B": 0, A: 1, B: 1 };
 
 function parseFindingsEnvelope(raw: string): unknown[] {
   const parsed = JSON.parse(extractJsonObject(raw)) as {
@@ -93,17 +96,31 @@ export function parseJudgeFindings(raw: string): JudgeFinding[] {
     };
   });
 
-  // Defensive re-application of the judge's own rules: severity ordering and
-  // the hard cap hold even if the model drifts.
+  // Defensive re-application of the judge's own rules (judge.system.md §4):
+  // rank by severity, then let `A+B` independent agreement break ties upward,
+  // and enforce the hard cap — all hold even if the model drifts. Array.sort is
+  // stable, so within an equal (severity, tag) the judge's own order survives.
   return findings
-    .sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity])
+    .sort(
+      (a, b) =>
+        SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity] ||
+        TAG_RANK[a.tag] - TAG_RANK[b.tag],
+    )
     .slice(0, MAX_JUDGE_FINDINGS);
 }
 
 export const REVIEW_COMMENT_MARKER = "<!-- ai-adversarial-review -->";
 
 function escapeTableCell(text: string): string {
-  return text.replace(/\|/g, "\\|").replace(/\r?\n/g, "<br>");
+  // Neutralize HTML-comment delimiters so model-derived text can't forge the
+  // dedup marker (REVIEW_COMMENT_MARKER) or any `<!-- … -->` control sequence
+  // the posting step keys on. HTML-encoding the angle brackets renders them as
+  // literal text in the GitHub table cell.
+  return text
+    .replace(/\|/g, "\\|")
+    .replace(/<!--/g, "&lt;!--")
+    .replace(/-->/g, "--&gt;")
+    .replace(/\r?\n/g, "<br>");
 }
 
 export function formatReviewComment(args: {

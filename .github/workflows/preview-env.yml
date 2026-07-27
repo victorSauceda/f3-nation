@@ -272,9 +272,18 @@ jobs:
 
       - name: Smoke test
         run: |
-          # api liveness (root redirects to /docs)
-          API_CODE=$(curl -sS -o /dev/null -w '%{http_code}' -L "${{ steps.meta.outputs.url_api }}/")
-          echo "api / -> ${API_CODE}"
+          # api liveness (root redirects to /docs). Scale-to-zero, so the first
+          # hit may cold-start; retry, and FAIL on any non-2xx/3xx (a 5xx or 000
+          # must not pass silently — matching the auth/map checks below).
+          for i in $(seq 1 10); do
+            API_CODE=$(curl -sS -o /dev/null -w '%{http_code}' -L "${{ steps.meta.outputs.url_api }}/")
+            echo "api / -> ${API_CODE} (attempt $i)"
+            case "${API_CODE}" in
+              2*|3*) break ;;
+            esac
+            [ "$i" = "10" ] && { echo "api never returned a healthy status (last: ${API_CODE})"; exit 1; }
+            sleep 5
+          done
           # auth: /api/health checks the DB sidecar and the JWKS key; first
           # hit may be a cold start, so retry until 200.
           for i in $(seq 1 10); do

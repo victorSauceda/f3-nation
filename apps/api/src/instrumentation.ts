@@ -14,8 +14,11 @@ export const onRequestError: Instrumentation.onRequestError = async (
 ) => {
   if (process.env.NEXT_RUNTIME === "nodejs") {
     const { captureServerException } = await import("./posthog-server");
-    captureServerException(err, {
-      path: request.path,
+    // Strip the query string before reporting — it can carry emails, tokens, or
+    // other PII. The pathname alone is enough to triage the error.
+    const path = request.path.split("?")[0];
+    await captureServerException(err, {
+      path,
       method: request.method,
     });
   }

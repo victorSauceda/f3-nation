@@ -22,8 +22,9 @@
  *   CI_FACTORY_REVIEW_B_API_KEY / _BASE_URL / _MODEL   Reviewer B (OpenAI)
  *   CI_FACTORY_JUDGE_MODEL                             Judge (A's credentials)
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 
+import { flagValue, readRequiredFile } from "./cli-args";
 import { getPromptRevision } from "./format-comment";
 import {
   formatReviewComment,
@@ -38,21 +39,6 @@ import {
   renderReviewerBUserPrompt,
 } from "./load-prompt";
 import { getReviewInferenceConfigFromEnv } from "./review-config";
-
-function flagValue(name: string): string | undefined {
-  const eq = process.argv.find((arg) => arg.startsWith(`${name}=`));
-  if (eq) return eq.slice(name.length + 1);
-  const idx = process.argv.indexOf(name);
-  if (idx !== -1) return process.argv[idx + 1];
-  return undefined;
-}
-
-function readRequiredFile(label: string, filePath: string | undefined): string {
-  if (!filePath) {
-    throw new Error(`Missing required flag: --${label} <path>`);
-  }
-  return readFileSync(filePath, "utf8");
-}
 
 async function main(): Promise<void> {
   const dryRun = process.argv.includes("--dry-run");

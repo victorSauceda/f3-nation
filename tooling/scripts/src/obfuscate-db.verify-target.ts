@@ -25,6 +25,8 @@
  */
 import postgres from "postgres";
 
+import { databaseNameFromUrl } from "./db-url";
+
 const OBFUSCATED_EMAIL_DOMAIN = "obfuscated.f3nation.dev";
 const EMAIL_REGEX = /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/g;
 // Retina-image filenames (logo@2x.png) are email-shaped; not PII.
@@ -69,6 +71,18 @@ function quoteQualified(table: string): string {
     .split(".")
     .map((part) => `"${part}"`)
     .join(".");
+}
+
+/**
+ * Whether a (schema-qualified) table exists. The EMPTY_TABLES list carries both
+ * the repo schema's plural names and better-auth's singular ones; only one
+ * family exists in any given target, so absent members are expected, not
+ * failures.
+ */
+async function tableExists(sql: Sql, table: string): Promise<boolean> {
+  const [row] = await sql<{ present: boolean }[]>`
+    SELECT to_regclass(${quoteQualified(table)}) IS NOT NULL AS present`;
+  return row?.present ?? false;
 }
 
 /** Collect every string in a JSON value: leaves and object keys. */
@@ -147,8 +161,17 @@ async function main(): Promise<void> {
   if (!databaseUrl) {
     throw new Error("DATABASE_URL is not set");
   }
-  const dbName = /\/([^/?]+)(?:\?|$)/.exec(databaseUrl)?.[1];
-  if (dbName && /prod/i.test(dbName)) {
+  const dbName = databaseNameFromUrl(databaseUrl);
+  // Fail closed: if the database name can't be derived we cannot prove the
+  // target isn't production, and sweeping an un-obfuscated database would print
+  // raw PII to the console.
+  if (!dbName) {
+    throw new Error(
+      "Refusing to run: could not derive a database name from DATABASE_URL — " +
+        "cannot verify the target is not production.",
+    );
+  }
+  if (/prod/i.test(dbName)) {
     throw new Error(
       `Refusing to run: database name "${dbName}" looks like production — ` +
         `sweeping an un-obfuscated database would print raw PII.`,
@@ -162,6 +185,10 @@ async function main(): Promise<void> {
     await sweepForEmails(sql);
 
     for (const table of EMPTY_TABLES) {
+      if (!(await tableExists(sql, table))) {
+        check(`${table} empty`, true, "absent (not in this schema — skipped)");
+        continue;
+      }
       const [row] = await sql.unsafe(
         `SELECT count(*)::int AS n FROM ${quoteQualified(table)}`,
       );
@@ -206,7 +233,7 @@ async function main(): Promise<void> {
       SELECT count(*)::int AS n FROM auth.oauth_clients
       WHERE client_secret_hash IS NOT NULL
         AND client_secret_hash != encode(sha256(('revoked:' || id)::bytea), 'hex')
-        AND id LIKE '%-local'`;
+        AND id NOT LIKE '%-local'`;
     const [singularSecrets] = await sql<{ n: number }[]>`
       SELECT count(*)::int AS n FROM auth.oauth_client
       WHERE client_secret IS NOT NULL AND client_secret NOT LIKE 'revoked-%'`;

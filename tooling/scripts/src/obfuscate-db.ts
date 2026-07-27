@@ -34,6 +34,8 @@ import { createHash } from "node:crypto";
 
 import postgres from "postgres";
 
+import { databaseNameFromUrl } from "./db-url";
+
 // ---------------------------------------------------------------------------
 // CLI args
 // ---------------------------------------------------------------------------
@@ -267,7 +269,27 @@ async function runSetBased(
   }
 }
 
+/**
+ * Whether a (schema-qualified) table exists. The secret/session/token lists
+ * carry both the repo schema's plural names and better-auth's singular ones;
+ * only one family exists in any given target, so absent members must be skipped
+ * rather than crash the run with an undefined-table error.
+ */
+async function tableExists(sql: Sql, table: string): Promise<boolean> {
+  const quoted = table
+    .split(".")
+    .map((part) => `"${part}"`)
+    .join(".");
+  const [row] = await sql<{ present: boolean }[]>`
+    SELECT to_regclass(${quoted}) IS NOT NULL AS present`;
+  return row?.present ?? false;
+}
+
 async function truncateTable(sql: Sql, table: string): Promise<void> {
+  if (!(await tableExists(sql, table))) {
+    addSummary(table, "*", "truncate (absent — skipped)", 0);
+    return;
+  }
   const [row] = await sql`SELECT count(*)::int AS n FROM ${sql(table)}`;
   const n = (row as Row).n as number;
   if (!DRY_RUN) {
@@ -277,15 +299,22 @@ async function truncateTable(sql: Sql, table: string): Promise<void> {
 }
 
 /** Truncate a set of tables in one statement — required when they hold
- * foreign keys to each other (single-table order would fail). */
+ * foreign keys to each other (single-table order would fail). Absent tables are
+ * dropped from the set so a missing better-auth family doesn't abort the run. */
 async function truncateTables(sql: Sql, tables: string[]): Promise<void> {
+  const present: string[] = [];
   for (const table of tables) {
+    if (!(await tableExists(sql, table))) {
+      addSummary(table, "*", "truncate (absent — skipped)", 0);
+      continue;
+    }
     const [row] = await sql`SELECT count(*)::int AS n FROM ${sql(table)}`;
     addSummary(table, "*", "truncate", (row as Row).n as number);
+    present.push(table);
   }
-  if (!DRY_RUN) {
+  if (!DRY_RUN && present.length > 0) {
     await sql.unsafe(
-      `TRUNCATE TABLE ${tables
+      `TRUNCATE TABLE ${present
         .map((t) =>
           t
             .split(".")
@@ -432,7 +461,7 @@ async function obfuscate(sql: Sql): Promise<void> {
         return null; // committed dev fixture — keep the whole row
       }
       const changes: Row = {};
-      if (email) changes.email = fakeEmail(email);
+      if (email && !isAllowlistedEmail(email)) changes.email = fakeEmail(email);
       for (const col of ["f3_name", "first_name", "last_name"]) {
         const v = str(row[col]);
         if (v) changes[col] = fakeName(`${col}:${v}`);
@@ -494,7 +523,7 @@ async function obfuscate(sql: Sql): Promise<void> {
       if (slackId) changes.slack_id = fakeSlackId(slackId);
       const userName = str(row.user_name);
       if (userName) changes.user_name = fakeName(`slack:${userName}`);
-      if (email) changes.email = fakeEmail(email);
+      if (email && !isAllowlistedEmail(email)) changes.email = fakeEmail(email);
       for (const col of [
         "avatar_url",
         "strava_access_token",
@@ -869,7 +898,7 @@ async function obfuscate(sql: Sql): Promise<void> {
         if (v) changes[col] = fakeName(v);
       }
       const email = row.email as string | null;
-      if (email) changes.email = fakeEmail(email);
+      if (email && !isAllowlistedEmail(email)) changes.email = fakeEmail(email);
       if (row.image !== null) changes.image = null;
       return changes;
     },
@@ -991,8 +1020,7 @@ async function obfuscate(sql: Sql): Promise<void> {
 // ---------------------------------------------------------------------------
 
 function getDatabaseNameFromUrl(url: string): string | undefined {
-  const match = /\/([^/?]+)(\?|$)/.exec(url);
-  return match?.[1];
+  return databaseNameFromUrl(url);
 }
 
 function printSummary(): void {

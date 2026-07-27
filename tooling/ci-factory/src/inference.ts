@@ -3,6 +3,10 @@ export interface ChatCompletionRequest {
   userPrompt: string;
 }
 
+/** Per-request inference timeout. Large diffs on a slow tier still fit; a hung
+ * endpoint is aborted rather than stalling the whole CI job. */
+const INFERENCE_TIMEOUT_MS = 120_000;
+
 export interface InferenceConfig {
   apiKey: string;
   baseUrl: string;
@@ -88,28 +92,39 @@ export async function runChatCompletion(args: {
   temperature?: number;
 }): Promise<string> {
   const url = `${args.config.baseUrl.replace(/\/$/, "")}/chat/completions`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${args.config.apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(buildChatCompletionBody(args)),
-  });
 
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(
-      `Inference request failed (${response.status}): ${body.slice(0, 500)}`,
-    );
-  }
+  // Bound the request: a hung endpoint would otherwise stall the CI job until
+  // the whole workflow times out. Abort covers the body read too, and the timer
+  // is always cleared so it can't leak past a settled request.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), INFERENCE_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${args.config.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(buildChatCompletionBody(args)),
+      signal: controller.signal,
+    });
 
-  const payload = (await response.json()) as {
-    choices?: { message?: { content?: string | null } }[];
-  };
-  const content = payload.choices?.[0]?.message?.content?.trim();
-  if (!content) {
-    throw new Error("Inference response did not include message content");
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(
+        `Inference request failed (${response.status}): ${body.slice(0, 500)}`,
+      );
+    }
+
+    const payload = (await response.json()) as {
+      choices?: { message?: { content?: string | null } }[];
+    };
+    const content = payload.choices?.[0]?.message?.content?.trim();
+    if (!content) {
+      throw new Error("Inference response did not include message content");
+    }
+    return content;
+  } finally {
+    clearTimeout(timeout);
   }
-  return content;
 }

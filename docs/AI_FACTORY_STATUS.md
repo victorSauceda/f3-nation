@@ -24,7 +24,7 @@
 
 **Live (adversarial review, F3-62 phase 1 — behind the `ai-review` label):**
 
-- `.github/workflows/adversarial-review.yml` runs on `pull_request`
+- `.github/workflows/adversarial-review.yml` runs on `pull_request_target`
   `[labeled, synchronize]` for same-repo PRs carrying the `ai-review` label
   (opt-in in phase 1). It collects the `origin/main...HEAD` diff (capped at
   ~120KB with a truncation note), all `specs/*.md` when the diff touches

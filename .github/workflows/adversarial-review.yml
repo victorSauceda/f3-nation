@@ -31,6 +31,13 @@ on:
 
 permissions: {}
 
+# Serialize per PR so the read-comment → decide → upsert-comment sequence can't
+# race with itself. Cancel superseded runs: a newer push makes an in-flight
+# review of the older SHA stale, and the upsert is idempotent per PR.
+concurrency:
+  group: adversarial-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   review:
     # Opt-in via the `ai-review` label; same-repo head only (fork PRs never

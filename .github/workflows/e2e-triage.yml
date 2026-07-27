@@ -25,6 +25,14 @@ on:
 
 permissions: {}
 
+# Serialize per branch: the read-comments → decide-dedupe → post-comment
+# sequence below is a check-then-act race if two runs for the same branch
+# interleave (both could miss each other's marker and double-post). Never
+# cancel — a superseded run may still hold the only comment for its failure.
+concurrency:
+  group: e2e-triage-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
 jobs:
   collect-and-classify:
     # Preview Environment also runs on schedule/workflow_dispatch (the
@@ -41,6 +49,7 @@ jobs:
       RUN_ID: ${{ github.event.workflow_run.id }}
       RUN_URL: ${{ github.event.workflow_run.html_url }}
       HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
       TRIAGE_DIR: /tmp/e2e-triage
     steps:
       - name: Detect failed e2e jobs and PR number
@@ -93,12 +102,16 @@ jobs:
             echo "job_names=${JOB_NAMES}"
           } >> "$GITHUB_OUTPUT"
 
+      # SECURITY: this privileged workflow_run job holds the inference API key
+      # and a pull-requests:write token, and the triggering "Preview Environment"
+      # runs on pull_request (incl. forks). We therefore check out and EXECUTE
+      # only trusted default-branch code (the setup action, package scripts, the
+      # ci-factory CLI, and prompts). The PR-authored failing spec is pulled in
+      # as DATA (never executed) from head_sha via the contents API below — the
+      # textbook pwn-request avoidance, matching adversarial-review.yml.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         if: steps.detect.outputs.proceed == 'true'
         with:
-          # The failing spec source must come from the commit that failed,
-          # not the default branch this workflow runs from.
-          ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
 
       - name: Collect error context and failing spec source
@@ -154,19 +167,27 @@ jobs:
           fi
 
           # Failing spec source: match test-results dir names back to spec
-          # files (dir name is prefixed with the spec file stem).
+          # files (dir name is prefixed with the spec file stem). The specs are
+          # PR-authored, so we pull them from head_sha as DATA via the contents
+          # API into TRIAGE_DIR (which nothing executes) — never from a checkout
+          # of the untrusted commit. See the security note on the checkout step.
           : > "${TRIAGE_DIR}/spec-source.txt"
-          for SPEC in apps/map/tests/e2e/*.spec.ts; do
-            [ -e "$SPEC" ] || continue
+          gh api "repos/${GITHUB_REPOSITORY}/git/trees/${HEAD_SHA}?recursive=1" \
+            --jq '.tree[] | select(.type == "blob") | .path
+                  | select(test("^apps/map/tests/e2e/[^/]+\\.spec\\.ts$"))' \
+            > "${TRIAGE_DIR}/spec-paths.txt" 2>/dev/null || true
+          while read -r SPEC; do
+            [ -n "$SPEC" ] || continue
             STEM=$(basename "$SPEC" .spec.ts)
             if [ ! -s "${TRIAGE_DIR}/test-dirs.txt" ] || grep -q "^${STEM}-" "${TRIAGE_DIR}/test-dirs.txt"; then
               {
                 echo "=== ${SPEC} ==="
-                cat "$SPEC"
+                gh api "repos/${GITHUB_REPOSITORY}/contents/${SPEC}?ref=${HEAD_SHA}" \
+                  --jq '.content' | base64 -d || true
                 echo
               } >> "${TRIAGE_DIR}/spec-source.txt"
             fi
-          done
+          done < "${TRIAGE_DIR}/spec-paths.txt"
 
       - name: Fingerprint and dedupe
         if: steps.detect.outputs.proceed == 'true'
@@ -206,8 +227,9 @@ jobs:
           fi
           echo "proceed=true" >> "$GITHUB_OUTPUT"
 
-      # Toolchain for @acme/ci-factory (the checkout above is at head_sha, so
-      # the package, prompts, and lockfile come from the failing commit).
+      # Toolchain for @acme/ci-factory. The checkout above is the trusted
+      # default branch, so the setup action, package, prompts, and lockfile all
+      # come from trusted code — never the PR under triage.
       - uses: ./.github/actions/setup
         if: steps.detect.outputs.proceed == 'true' && steps.fingerprint.outputs.proceed == 'true'
 

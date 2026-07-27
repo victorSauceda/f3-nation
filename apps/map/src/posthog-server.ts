@@ -28,14 +28,16 @@ function getPostHogServer(): PostHog | undefined {
  * Capture a server-side error as a PostHog `$exception` event. Non-`Error`
  * values are wrapped so PostHog error tracking always gets a real stack.
  */
-export function captureServerException(
+export async function captureServerException(
   err: unknown,
   properties?: Record<string, unknown>,
-) {
+): Promise<void> {
   const posthog = getPostHogServer();
   if (!posthog) return;
   const error = err instanceof Error ? err : new Error(String(err));
-  posthog.captureException(error, undefined, {
+  // Immediate (awaited) send: the queued captureException can be lost when a
+  // scale-to-zero Cloud Run instance is reaped before the async flush runs.
+  await posthog.captureExceptionImmediate(error, undefined, {
     environment: env.F3_CHANNEL,
     ...properties,
   });
@@ -50,6 +52,12 @@ export function captureServerException(
  */
 export function registerPostHogErrorReporter() {
   setErrorReporter((event: string, ctx: LogContext, err?: unknown) => {
-    captureServerException(err ?? new Error(event), { event, ...ctx });
+    // logError/logFatal are synchronous, so this bridge can't await. Fire and
+    // forget with a catch so a failed send never becomes an unhandled
+    // rejection; the request-error path (instrumentation) awaits directly.
+    void captureServerException(err ?? new Error(event), {
+      event,
+      ...ctx,
+    }).catch(() => undefined);
   });
 }

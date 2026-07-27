@@ -20,6 +20,7 @@
  */
 import { readFileSync, writeFileSync } from "node:fs";
 
+import { flagValue, readRequiredFile } from "./cli-args";
 import {
   formatTriageComment,
   getPromptRevision,
@@ -30,21 +31,6 @@ import {
   loadTriagePhase1SystemPrompt,
   renderTriagePhase1UserPrompt,
 } from "./load-prompt";
-
-function flagValue(name: string): string | undefined {
-  const eq = process.argv.find((arg) => arg.startsWith(`${name}=`));
-  if (eq) return eq.slice(name.length + 1);
-  const idx = process.argv.indexOf(name);
-  if (idx !== -1) return process.argv[idx + 1];
-  return undefined;
-}
-
-function readRequiredFile(label: string, filePath: string | undefined): string {
-  if (!filePath) {
-    throw new Error(`Missing required flag: --${label} <path>`);
-  }
-  return readFileSync(filePath, "utf8");
-}
 
 async function main(): Promise<void> {
   const dryRun = process.argv.includes("--dry-run");
