@@ -81,23 +81,28 @@ async function main(): Promise<void> {
   const reviewerBConfig = getReviewInferenceConfigFromEnv("reviewer-b");
   const judgeConfig = getReviewInferenceConfigFromEnv("judge");
 
-  console.log(`Running reviewer A (${reviewerAConfig.model})...`);
-  const rawA = await runChatCompletion({
-    config: reviewerAConfig,
-    systemPrompt: reviewerASystem,
-    userPrompt: reviewerAUser,
-  });
+  // A and B are independent (neither sees the other's output), so run them
+  // concurrently — the judge needs both before it can start anyway.
+  console.log(
+    `Running reviewers A (${reviewerAConfig.model}) and B (${reviewerBConfig.model}) in parallel...`,
+  );
+  const [rawA, rawB] = await Promise.all([
+    runChatCompletion({
+      config: reviewerAConfig,
+      systemPrompt: reviewerASystem,
+      userPrompt: reviewerAUser,
+    }),
+    runChatCompletion({
+      config: reviewerBConfig,
+      systemPrompt: reviewerBSystem,
+      userPrompt: reviewerBUser,
+    }),
+  ]);
   const findingsA = parseReviewerFindings(rawA);
-  console.log(`Reviewer A: ${findingsA.length} finding(s).`);
-
-  console.log(`Running reviewer B (${reviewerBConfig.model})...`);
-  const rawB = await runChatCompletion({
-    config: reviewerBConfig,
-    systemPrompt: reviewerBSystem,
-    userPrompt: reviewerBUser,
-  });
   const findingsB = parseReviewerFindings(rawB);
-  console.log(`Reviewer B: ${findingsB.length} finding(s).`);
+  console.log(
+    `Reviewer A: ${findingsA.length} finding(s); Reviewer B: ${findingsB.length} finding(s).`,
+  );
 
   console.log(`Running judge (${judgeConfig.model})...`);
   const rawJudge = await runChatCompletion({

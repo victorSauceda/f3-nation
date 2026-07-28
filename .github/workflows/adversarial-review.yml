@@ -85,8 +85,10 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         if: steps.dedupe.outputs.proceed == 'true'
         with:
-          # Review the head commit; full history so origin/main...HEAD works.
-          # Trusted base checkout — see security model above.
+          # Trusted BASE checkout — the ci-factory CLI, prompts, and setup
+          # action all run from base (never PR head). See the security model
+          # above. The PR is consumed as data: the diff comes from `gh pr diff`,
+          # not a local git range, so no PR history is fetched here.
           ref: ${{ github.event.pull_request.base.sha }}
           persist-credentials: false
 

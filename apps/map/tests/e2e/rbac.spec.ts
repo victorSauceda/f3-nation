@@ -63,16 +63,10 @@ const API_KEYS = {
   noRole: "local-map-key",
 } as const;
 
-const apiUrl = process.env.E2E_API_URL;
-if (!apiUrl) {
-  throw new Error(
-    "E2E_API_URL is required but not set. Point it at the api deployment " +
-      "under test, e.g. " +
-      "E2E_API_URL=https://pr-123-api-<project>.us-central1.run.app " +
-      "pnpm test:e2e",
-  );
-}
-const API_URL = apiUrl.replace(/\/$/, "");
+// Required at run time, but do NOT throw at module load: a module-scope throw
+// aborts Playwright's collection of every other spec. The value is asserted in
+// beforeAll below, so a missing var fails only this file.
+const API_URL = (process.env.E2E_API_URL ?? "").replace(/\/$/, "");
 
 // Cold-starting scale-to-zero preview: first request may wait out a boot.
 const REQUEST_TIMEOUT_MS = 60_000;
@@ -258,6 +252,17 @@ function rejectSubmission(
 }
 
 test.describe("update-request RBAC (direct api)", () => {
+  test.beforeAll(() => {
+    if (!API_URL) {
+      throw new Error(
+        "E2E_API_URL is required but not set. Point it at the api deployment " +
+          "under test, e.g. " +
+          "E2E_API_URL=https://pr-123-api-<project>.us-central1.run.app " +
+          "pnpm test:e2e",
+      );
+    }
+  });
+
   test("non-editor submit is recorded as a pending request (AC-8)", async ({
     request,
   }) => {
@@ -358,9 +363,9 @@ test.describe("update-request RBAC (direct api)", () => {
     expect(rejectRes.status()).toBe(401);
     const rejectBody = (await rejectRes.json()) as OrpcErrorBody;
     expect(rejectBody.code).toBe("UNAUTHORIZED");
-    expect(rejectBody.message).toBe(
-      "You are not authorized to edit this region",
-    );
+    // Substring, not exact-match: assert it identifies the region-authorization
+    // failure without pinning the test to the exact copy.
+    expect(rejectBody.message).toMatch(/not authorized.*region/i);
 
     // Assert: the request is still pending.
     const byId = await getJson<RequestByIdResponse>(

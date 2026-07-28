@@ -30,10 +30,11 @@ export function renderTriagePhase1UserPrompt(args: {
     ? `**Preview URL:** ${args.previewUrl}\n`
     : "";
 
-  return template
-    .replace("{{PREVIEW_URL_SECTION}}", previewUrlSection)
-    .replace("{{ERROR_CONTEXT}}", args.errorContext.trim())
-    .replace("{{TEST_SOURCE}}", args.testSource.trim());
+  return fill(template, {
+    PREVIEW_URL_SECTION: previewUrlSection,
+    ERROR_CONTEXT: args.errorContext.trim(),
+    TEST_SOURCE: args.testSource.trim(),
+  });
 }
 
 /**
@@ -50,13 +51,16 @@ export function loadReviewPhase1SystemPrompt(role: ReviewPromptRole): string {
   return `${guardrails}\n\n${system}`;
 }
 
-// Replacement callbacks keep `$`-sequences in diffs/spec text literal —
-// String.replace treats `$&`/`$'` in a string replacement specially.
+// Single pass over the ORIGINAL template: every {{KEY}} is resolved exactly
+// once from `values`, so an injected artifact that itself contains `{{DIFF}}`
+// can never be re-substituted on a later pass. The function replacer keeps
+// `$`-sequences (`$&`/`$'`) in diffs/spec text literal, and unknown
+// placeholders are left untouched.
 function fill(template: string, values: Record<string, string>): string {
-  return Object.entries(values).reduce(
-    (acc, [key, value]) => acc.replace(`{{${key}}}`, () => value),
-    template,
-  );
+  return template.replace(/\{\{(\w+)\}\}/g, (match, key: string) => {
+    const value = values[key];
+    return value ?? match;
+  });
 }
 
 export function renderReviewerAUserPrompt(args: {

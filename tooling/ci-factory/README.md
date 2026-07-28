@@ -6,7 +6,7 @@ review (F3-62) before any auto-heal work lands in phase 2.
 
 ## Layout
 
-```
+```text
 prompts/
   shared.guardrails.md           Non-negotiable rules (all phases)
   triage-phase-1.system.md       Phase-1 classifier instructions
@@ -70,13 +70,16 @@ export CI_FACTORY_INFERENCE_API_KEY="..."
 export CI_FACTORY_INFERENCE_MODEL="claude-haiku-4-5-20251001"
 ```
 
-## Wiring into preview E2E (next step)
+## Wiring into preview E2E (live)
 
-After a Playwright job fails in `preview-env.yml`:
+`.github/workflows/e2e-triage.yml` runs this after a Playwright job fails in
+`preview-env.yml`:
 
-1. Upload error output + test source as artifacts
+1. Collect the Playwright error output + failing spec source
 2. Run `pnpm -F @acme/ci-factory triage ... --output comment.md`
-3. Post `comment.md` to the PR (marker: `<!-- f3-ci-factory-triage -->`)
+3. Post one comment-only summary per fingerprint to the PR (marker:
+   `<!-- ai-triage:<fingerprint> -->`), deduped and capped so a repeat failure
+   never re-comments. Advisory by design: no fix PRs, label writes, or merges.
 
 Phase 2 (auto-heal) will add separate prompts under `prompts/` — do not extend
 the phase-1 prompt with fix instructions.

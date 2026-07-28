@@ -6,7 +6,9 @@
 # The official postgres entrypoint restores it on first boot (PGDATA lives on
 # an in-memory emptyDir in Cloud Run, so every cold start is a fresh,
 # identical database — that determinism is what the E2E blocking tier needs).
-FROM postgres:18
+# Pinned to an exact patch for reproducible preview databases; keep in sync
+# with the postgres image in .github/workflows/preview-env.yml.
+FROM postgres:18.0
 
 ENV POSTGRES_USER=f3local \
     POSTGRES_PASSWORD=f3local \

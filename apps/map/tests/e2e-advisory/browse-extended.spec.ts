@@ -81,12 +81,25 @@ test.describe("map browse & search extras (anonymous, advisory)", () => {
 
   test("denied geolocation leaves the map view usable, control muted, no marker (AC-14)", async ({
     page,
-    context,
   }) => {
-    // Granting an empty permission set makes Chromium reject everything
-    // else, so the app's `navigator.permissions.query({ name: "geolocation" })`
-    // resolves to "denied" (not "prompt").
-    await context.grantPermissions([]);
+    // Establish a real "denied" geolocation state before any page script runs.
+    // grantPermissions([]) does NOT deny — it leaves Chromium in "prompt" — so
+    // stub the Permissions API and geolocation directly to force denial, which
+    // is what the app's `navigator.permissions.query({ name: "geolocation" })`
+    // and getCurrentPosition paths key on.
+    await page.addInitScript(() => {
+      navigator.permissions.query = () =>
+        Promise.resolve({ state: "denied" } as PermissionStatus);
+      navigator.geolocation.getCurrentPosition = (_success, error) => {
+        error?.({
+          code: 1, // PERMISSION_DENIED
+          message: "User denied Geolocation",
+          PERMISSION_DENIED: 1,
+          POSITION_UNAVAILABLE: 2,
+          TIMEOUT: 3,
+        } as GeolocationPositionError);
+      };
+    });
 
     await page.goto("/");
     await expect(page.getByTestId("map")).toBeVisible();
@@ -104,10 +117,7 @@ test.describe("map browse & search extras (anonymous, advisory)", () => {
       .first();
     await control.click();
 
-    // The muted icon treatment (`text-muted`) only applies when the
-    // Permissions API reports "denied"; Playwright's grantPermissions([])
-    // leaves Chromium in "prompt", so that styling isn't deterministic here
-    // (confirmed by the first live run). The observable AC-14 contract:
+    // The observable AC-14 contract, now that denial is deterministic:
     // …no geolocation marker is rendered…
     await expect(page.getByTestId("geolocation-marker")).toHaveCount(0);
     // …and the map view is unchanged: same route, same nearby anchor.

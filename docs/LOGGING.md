@@ -194,10 +194,11 @@ argument. You don't call PostHog directly — error logging already reaches it.
 
 ## The golden rule: never log secrets or PII
 
-Structured logs land in stdout and in PostHog, so treat them as if they're
-permanent and widely readable. **Never** put secrets, tokens, full request
-bodies, or personal data (emails, phone numbers, emergency contacts) into
-`event` or `ctx`.
+Structured logs land in stdout, and error-level logs (`logError`/`logFatal`)
+also reach PostHog error tracking via the reporter bridge — so treat them as if
+they're permanent and widely readable. **Never** put secrets, tokens, full
+request bodies, or personal data (emails, phone numbers, emergency contacts)
+into `event` or `ctx`.
 
 Log **identifiers, not personal data** — `{ userId }`, not `{ email }`;
 `Object.keys(updateSet)` (which fields changed), not the values themselves. When

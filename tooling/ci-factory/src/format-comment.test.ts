@@ -59,6 +59,48 @@ describe("parseTriageResult", () => {
 
     expect(result.classification).toBe("test-bug");
   });
+
+  const validTriage: Record<string, unknown> = {
+    classification: "flake",
+    confidence: "medium",
+    human_review_required: false,
+    summary: "Likely cold-start timeout.",
+    evidence: ["Exceeded 30s navigation timeout on first load."],
+    recommended_next_step: "Re-run the preview E2E job once.",
+    retry_likely_to_pass: true,
+  };
+
+  it.each([
+    [
+      "invalid classification",
+      { ...validTriage, classification: "not-a-class" },
+      /Invalid classification/,
+    ],
+    [
+      "invalid confidence",
+      { ...validTriage, confidence: "certain" },
+      /Invalid confidence/,
+    ],
+    ["empty evidence", { ...validTriage, evidence: [] }, /evidence must be/],
+    [
+      "non-boolean human_review_required",
+      { ...validTriage, human_review_required: "yes" },
+      /human_review_required must be a boolean/,
+    ],
+    [
+      "non-boolean retry_likely_to_pass",
+      { ...validTriage, retry_likely_to_pass: 1 },
+      /retry_likely_to_pass must be a boolean/,
+    ],
+  ])("rejects %s", (_label, payload, message) => {
+    expect(() => parseTriageResult(JSON.stringify(payload))).toThrow(message);
+  });
+
+  it("rejects input with no JSON object", () => {
+    expect(() => parseTriageResult("no json here at all")).toThrow(
+      /did not contain a JSON object/,
+    );
+  });
 });
 
 describe("formatTriageComment", () => {

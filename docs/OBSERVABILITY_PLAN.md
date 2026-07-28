@@ -11,7 +11,7 @@
 > cost. Migration: remove @sentry/nextjs from map+api, point
 > @acme/logger's error bridge at PostHog, wire posthog-js with masking ON
 > and per-product spend caps at $0.
-
+>
 > Scouting + planning deliverable for the AI-SDLC pilot: an OpenTelemetry
 > baseline for the pilot apps (`map`, `api`, `admin`) and a PostHog-vs-Sentry
 > free-tier evaluation. This is a **plan**, not an implementation — each phase
@@ -42,10 +42,10 @@
   Logging `severity` (`packages/logger/src/index.ts:14-21,80-86`) — so logs are
   already indexed and alertable in **Cloud Logging** per GCP project.
 - A process-global **error reporter** hook (`setErrorReporter`,
-  `packages/logger/src/index.ts:37-45`) fans `logError`/`logFatal` out to
-  Sentry where an app registers one (`packages/logger/src/index.ts:104-121`).
-  _(State at scout time — this sink is now **PostHog**, per the Owner
-  Decision above; rewired in PR #54.)_
+  `packages/logger/src/index.ts:37-45`) fans `logError`/`logFatal` out to a
+  registered sink. **At scout time** that sink was Sentry (PostHog absent);
+  _this is historical context — the active sink is now **PostHog**, per the
+  Owner Decision above, rewired in PR #54._
 - Every app instantiates a service-named logger (`apps/map/src/lib/logging.ts`
   → `f3-map`; `packages/api/src/logger.ts` → `acme-api`; admin/auth/me have the
   same pattern).
@@ -224,10 +224,12 @@ alerts OFF in previews.**
   happens — traces there are cheap (volume is tiny, and Cloud Trace's free
   ingestion allotment covers it; verify current free-tier numbers) and
   directly useful for agent debugging. Logs already flow.
-- The error tracker stays out of previews to avoid noise-flooding free-tier
-  quota. _(Written for Sentry; the principle carries to **PostHog** — PR #54
-  ships previews with server-side capture keyed but session recording off,
-  and the referenced `sentry.server.config.ts` files no longer exist.)_
+- The error tracker stays lightweight in previews to avoid noise-flooding
+  free-tier quota. _(Written for Sentry; the principle carries to **PostHog**,
+  whose actual preview behavior, per PR #54, is: with no key configured nothing
+  is captured; with the preview server key set, server-side error capture is
+  enabled; session recording stays disabled. The referenced
+  `sentry.server.config.ts` files no longer exist.)_
 - No alerting from preview or staging projects.
 
 ---
