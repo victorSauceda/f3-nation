@@ -9,8 +9,9 @@ export function databaseNameFromUrl(url: string): string | undefined {
   try {
     const { pathname } = new URL(url);
     const name = pathname.replace(/^\/+/, "").split("/")[0];
-    // Empty (e.g. the URL had no path) → "unknown", not "".
-    return name.length > 0 ? name : undefined;
+    // Empty/missing path segment (e.g. the URL had no path) → "unknown".
+    if (!name) return undefined;
+    return name;
   } catch {
     return undefined;
   }

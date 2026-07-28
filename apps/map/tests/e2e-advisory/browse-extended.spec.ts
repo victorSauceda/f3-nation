@@ -97,7 +97,7 @@ test.describe("map browse & search extras (anonymous, advisory)", () => {
           PERMISSION_DENIED: 1,
           POSITION_UNAVAILABLE: 2,
           TIMEOUT: 3,
-        } as GeolocationPositionError);
+        });
       };
     });
 
