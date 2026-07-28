@@ -2,424 +2,374 @@ import type { APIRequestContext } from "@playwright/test";
 import { expect, test } from "@playwright/test";
 
 /**
- * Blocking-tier RBAC E2E suite for the map update-request flow.
+ * Update-request RBAC — BLOCKING tier, API-only (no browser).
  *
- * Implements the RBAC-critical paths from
- * specs/map-update-request-flow.md §5 (RBAC table) + §8 (blocking tier)
- * via direct API calls — no browser, fully deterministic:
+ * Exercises the submission/review authorization matrix of
+ * specs/map-update-request-flow.md §5 directly against the API app
+ * (E2E_API_URL) using the seeded local API keys as principals. The browser
+ * suite (tests/e2e/update-request.spec.ts) cannot cover these paths because
+ * the local dev-mode credentials provider always yields a nation-admin
+ * session.
  *
- *   1. Non-editor submit → recorded `pending`            (§8.2, AC-8)
- *   2. Editor submit → auto-applied (`approved`)          (§8.3, AC-9)
- *   3. Non-editor reject is denied, request stays pending (§5 reject row)
- *   4. Cross-region editor reject is denied, request stays
- *      pending (§8.6, AC-15) — plus the positive control: the same
- *      region-scoped editor CAN reject inside its own region
- *   5. Unauthenticated submit is denied                   (§5 row 2)
+ * Test → AC mapping:
+ *   - "non-editor submit is recorded pending with no live change"   → AC-8
+ *   - "nation editor submit is auto-applied"                        → AC-9
+ *     (API half: status `approved` + the event exists in live data)
+ *   - "non-editor cannot reject and the request stays pending"      → §5 reject
+ *     row (editorProcedure denies role-less principals)
+ *   - "cross-region editor cannot reject; same editor can reject in
+ *      their own region"                                            → AC-15
+ *   - "unauthenticated submit is rejected"                          → §5 submit
+ *     row (protectedProcedure → UNAUTHORIZED)
  *
- * HOW PROCEDURES ARE INVOKED: the api app serves every oRPC procedure that
- * declares a `.route()` through its OpenAPI handler (apps/api/src/app/
- * [[...rest]]/route.ts). Requests whose `client` header is NOT an oRPC
- * client value ("orpc" / "orpc-ssg" / "f3-me") are dispatched by route path,
- * so plain REST calls work: POST {E2E_API_URL}/v1/request/update-request,
- * POST /v1/request/reject-submission, GET /v1/request/id/{id}, etc.
- * (router prefixes: packages/api/src/index.ts → os.prefix("/v1"),
- * os.prefix("/request")).
+ * Principals (seeded by pnpm db:seed:local —
+ * packages/db/src/local-seed-lib/data.ts LOCAL_API_KEYS):
+ *   - local-slackbot-key     admin on F3 Nation (used only for verification reads)
+ *   - local-api-key          editor on F3 Nation → auto-apply everywhere
+ *   - local-boone-editor-key editor scoped to the Boone REGION only
+ *   - local-map-key          no role (read-only tier) → submits go pending
  *
- * AUTH: recipe 1 of docs/PREVIEW_AUTH.md — seeded API keys as bearer tokens
- * plus the `client` header (required for API-key auth by getSession in
- * packages/api/src/shared.ts):
+ * Requests authenticate with `Authorization: Bearer <key>` plus a
+ * `client: e2e` header — any non-oRPC client value routes to the OpenAPI
+ * handler (apps/api/src/app/[[...rest]]/route.ts) and marks the bearer as an
+ * API key rather than a JWT.
  *
- *   - local-slackbot-key     → admin, scoped to the F3 Nation org
- *   - local-api-key          → editor, scoped to the F3 Nation org
- *   - local-boone-editor-key → editor, scoped to the BOONE REGION org only
- *   - local-map-key          → NO role (read-only tier is the absence of a role)
+ * REST paths come from packages/api/src/root.ts (prefix /v1, router prefix
+ * /request) plus each procedure's .route() in
+ * packages/api/src/router/request.ts:
+ *   POST /v1/request/create-event-request   (protectedProcedure)
+ *   POST /v1/request/reject-submission      (editorProcedure)
+ *   GET  /v1/request/id/{id}                (editorProcedure)
  *
- * SEED SCOPING: checkHasRoleOnOrg accepts a role on any ancestor org, so the
- * nation-scoped principals can edit BOTH seeded regions (Boone and
- * F3 Charlotte). local-boone-editor-key is the region-scoped principal
- * (packages/db/src/local-seed-lib/users.ts attaches its editor role to the
- * Boone region org, not the nation), which makes AC-15's precise case — an
- * editor of region S rejecting in region R — deterministically testable:
- * Boone is not an ancestor of F3 Charlotte, so rejectSubmission's
- * checkHasRoleOnOrg denies with UNAUTHORIZED ("You are not authorized to
- * edit this region", packages/api/src/router/request.ts) even though the
- * key clears the editorProcedure gate (editor on SOME org).
+ * DATA ASSUMPTIONS (deterministic local seed):
+ *   - Regions "Boone" and "F3 Charlotte" exist.
+ *   - Boone AOs "The Dark Tower" / "The Viaduct"; Charlotte AOs "The Foundry" /
+ *     "The Colosseum" / "South End Station"; every AO has one weekly
+ *     "<AO name> Bootcamp" event, Monday 05:30 AM.
+ *   - Event type "Bootcamp" exists.
+ *   All ids are resolved at runtime via API reads — never hardcoded. Created
+ *   events use unique name suffixes and Monday 05:30 AM so reruns never
+ *   collide and browse-suite determinism holds.
  *
- * DATA ASSUMPTION: E2E_API_URL is a preview api backed by the deterministic
- * sandbox seed (packages/db/src/local-seed-lib/data.ts): regions "Boone" and
- * "F3 Charlotte", Boone AO "The Dark Tower", Charlotte AO "The Colosseum",
- * event type "Bootcamp". Region/AO/event-type ids are resolved at runtime
- * through the routed org and event-type endpoints rather than hardcoded.
- * The preview DB persists for the duration of a run (resets on cold start),
- * so every test submits uniquely-named events/AOs — reruns never collide
- * and no cleanup is needed. New events are created at 05:30 AM to preserve
- * the AM/PM determinism browse.spec.ts relies on.
+ * Local-dev caveat: requests with NO Authorization header at all get the
+ * dev-mode mock session on a development API server
+ * (packages/api/src/shared.ts getDevMockSession), so the deterministic
+ * "unauthenticated" principal here is an invalid bearer token — a credential
+ * that resolves to no session in every environment.
  */
 
-const API_KEYS = {
-  admin: "local-slackbot-key",
-  editor: "local-api-key",
+const E2E_API_URL = process.env.E2E_API_URL;
+if (!E2E_API_URL) {
+  throw new Error(
+    "E2E_API_URL is required but not set. Point it at the API app under " +
+      "test, e.g. E2E_API_URL=http://localhost:3001",
+  );
+}
+const API = E2E_API_URL.replace(/\/$/, "");
+
+const KEYS = {
+  nationAdmin: "local-slackbot-key",
+  nationEditor: "local-api-key",
   booneEditor: "local-boone-editor-key",
-  noRole: "local-map-key",
+  readOnly: "local-map-key",
 } as const;
 
-// Required at run time, but do NOT throw at module load: a module-scope throw
-// aborts Playwright's collection of every other spec. The value is asserted in
-// beforeAll below, so a missing var fails only this file.
-const API_URL = (process.env.E2E_API_URL ?? "").replace(/\/$/, "");
+const headers = (key: string) => ({
+  Authorization: `Bearer ${key}`,
+  client: "e2e",
+});
 
-// Cold-starting scale-to-zero preview: first request may wait out a boot.
-const REQUEST_TIMEOUT_MS = 60_000;
+const uniqueSuffix = () =>
+  Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 
-interface OrgsResponse {
-  orgs: { id: number; name: string; orgType: string }[];
-  total: number;
+interface SeedRefs {
+  booneRegionId: number;
+  charlotteRegionId: number;
+  boone: { aoId: number; locationId: number };
+  charlotte: { aoId: number; locationId: number };
+  bootcampEventTypeId: number;
 }
 
-interface EventTypesResponse {
-  eventTypes: { id: number; name: string }[];
-}
+let seedRefs: SeedRefs | null = null;
 
-interface SubmitResponse {
-  status: string;
-  updateRequest?: { id?: string; status?: string; regionId?: number };
-}
+/** Resolve seeded org/AO/location/event-type ids at runtime (memoized). */
+async function resolveSeedRefs(request: APIRequestContext): Promise<SeedRefs> {
+  if (seedRefs) return seedRefs;
 
-interface RequestByIdResponse {
-  request: { id: string; status: string } | null;
-}
-
-interface OrpcErrorBody {
-  code?: string;
-  status?: number;
-  message?: string;
-}
-
-function headersFor(apiKey: string | null): Record<string, string> {
-  return {
-    // Any non-oRPC value routes to the OpenAPI handler AND satisfies the
-    // `client`-header requirement of API-key auth (packages/api/src/shared.ts).
-    client: "e2e",
-    ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+  const getRegionId = async (name: string) => {
+    const res = await request.get(`${API}/v1/org`, {
+      params: { orgTypes: "region", searchTerm: name },
+      headers: headers(KEYS.readOnly),
+    });
+    expect(res.ok()).toBe(true);
+    const { orgs } = (await res.json()) as {
+      orgs: { id: number; name: string }[];
+    };
+    const region = orgs.find((o) => o.name === name);
+    expect(region, `seeded region "${name}" should exist`).toBeTruthy();
+    if (!region) throw new Error(`region ${name} not found`);
+    return region.id;
   };
-}
 
-async function getJson<T>(
-  request: APIRequestContext,
-  path: string,
-  apiKey: string,
-  params?: Record<string, string>,
-): Promise<T> {
-  const res = await request.get(`${API_URL}${path}`, {
-    headers: headersFor(apiKey),
-    params,
-    timeout: REQUEST_TIMEOUT_MS,
+  // The seeded "<AO name> Bootcamp" event carries both the AO (parent) id and
+  // the location id.
+  const getAoRefs = async (aoName: string) => {
+    const res = await request.get(`${API}/v1/event`, {
+      params: { searchTerm: `${aoName} Bootcamp` },
+      headers: headers(KEYS.readOnly),
+    });
+    expect(res.ok()).toBe(true);
+    const { events } = (await res.json()) as {
+      events: {
+        name: string;
+        locationId: number;
+        parents: { parentId: number }[];
+      }[];
+    };
+    const event = events.find((e) => e.name === `${aoName} Bootcamp`);
+    expect(
+      event,
+      `seeded event "${aoName} Bootcamp" should exist`,
+    ).toBeTruthy();
+    if (!event?.parents[0]) throw new Error(`event for ${aoName} not found`);
+    return { aoId: event.parents[0].parentId, locationId: event.locationId };
+  };
+
+  const eventTypesRes = await request.get(`${API}/v1/event-type`, {
+    headers: headers(KEYS.readOnly),
   });
-  expect(res.status(), `GET ${path} should succeed`).toBe(200);
-  return (await res.json()) as T;
+  expect(eventTypesRes.ok()).toBe(true);
+  const { eventTypes } = (await eventTypesRes.json()) as {
+    eventTypes: { id: number; name: string }[];
+  };
+  const bootcamp = eventTypes.find((t) => t.name === "Bootcamp");
+  expect(bootcamp, 'event type "Bootcamp" should exist').toBeTruthy();
+  if (!bootcamp) throw new Error("Bootcamp event type not found");
+
+  seedRefs = {
+    booneRegionId: await getRegionId("Boone"),
+    charlotteRegionId: await getRegionId("F3 Charlotte"),
+    boone: await getAoRefs("The Dark Tower"),
+    charlotte: await getAoRefs("The Foundry"),
+    bootcampEventTypeId: bootcamp.id,
+  };
+  return seedRefs;
 }
 
-async function resolveOrgId(
-  request: APIRequestContext,
-  apiKey: string,
-  orgType: "region" | "ao",
-  name: string,
-): Promise<number> {
-  const body = await getJson<OrgsResponse>(request, "/v1/org/", apiKey, {
-    orgTypes: orgType,
-    searchTerm: name,
-  });
-  const org = body.orgs.find((o) => o.name === name);
-  expect(org, `seeded ${orgType} "${name}" should exist`).toBeTruthy();
-  return org!.id;
-}
-
-async function resolveBootcampTypeId(
-  request: APIRequestContext,
-  apiKey: string,
-): Promise<number> {
-  const body = await getJson<EventTypesResponse>(
-    request,
-    "/v1/event-type/",
-    apiKey,
-    { searchTerm: "Bootcamp" },
-  );
-  const bootcamp = body.eventTypes.find((et) => et.name === "Bootcamp");
-  expect(bootcamp, 'seeded event type "Bootcamp" should exist').toBeTruthy();
-  return bootcamp!.id;
-}
-
-/** Unique per submission so reruns against a warm preview never collide. */
-function uniqueSuffix(): string {
-  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-/**
- * A valid `create_event` payload for POST /v1/request/update-request
- * (RequestInsertSchema). With no eventId/locationId/aoId the apply path
- * creates a fresh location + AO + event, leaving seeded data untouched.
- */
-function createEventPayload(options: {
-  regionId: number;
-  eventTypeId: number;
-  suffix: string;
-  aoId?: number;
-  aoName?: string;
+/** Build a valid create_event payload against the given region/AO. */
+function createEventPayload(params: {
+  refs: SeedRefs;
+  region: "boone" | "charlotte";
+  eventName: string;
 }) {
-  const { regionId, eventTypeId, suffix, aoId, aoName } = options;
+  const { refs, region, eventName } = params;
+  const target = region === "boone" ? refs.boone : refs.charlotte;
   return {
     id: crypto.randomUUID(),
     requestType: "create_event",
-    regionId,
-    eventTypeIds: [eventTypeId],
-    eventName: `E2E RBAC Bootcamp ${suffix}`,
-    eventDescription: "Created by the RBAC blocking-tier E2E suite",
+    submittedBy: "e2e-rbac@f3local.dev",
+    originalRegionId:
+      region === "boone" ? refs.booneRegionId : refs.charlotteRegionId,
+    originalAoId: target.aoId,
+    originalLocationId: target.locationId,
+    eventName,
     eventDayOfWeek: "monday",
-    // 05:30 AM keeps the browse suite's AM/PM filter determinism intact.
+    // Monday 05:30 AM to preserve browse-suite determinism assumptions.
     eventStartTime: "0530",
     eventEndTime: "0615",
-    eventRecurrencePattern: "weekly",
-    eventRecurrenceInterval: 1,
-    ...(aoId !== undefined ? { aoId } : {}),
-    aoName: aoName ?? `E2E RBAC AO ${suffix}`,
-    locationName: `E2E RBAC Location ${suffix}`,
-    locationAddress: "123 E2E Test Street",
-    locationCity: "Boone",
-    locationState: "NC",
-    locationCountry: "US",
-    locationLat: 36.2168,
-    locationLng: -81.6746,
-    submittedBy: "e2e-rbac@f3local.dev",
+    eventTypeIds: [refs.bootcampEventTypeId],
   };
 }
 
-async function submitUpdateRequest(
+async function submitCreateEvent(
   request: APIRequestContext,
-  apiKey: string | null,
+  key: string,
   payload: ReturnType<typeof createEventPayload>,
 ) {
-  return request.post(`${API_URL}/v1/request/update-request`, {
-    headers: headersFor(apiKey),
+  return request.post(`${API}/v1/request/create-event-request`, {
+    headers: headers(key),
     data: payload,
-    timeout: REQUEST_TIMEOUT_MS,
   });
 }
 
-/**
- * Arrange helper: submit a valid create_event request with the no-role key
- * against a seeded region + AO. Non-editor submissions are never auto-applied,
- * so this deterministically yields a `pending` request; returns its id.
- */
-async function submitPendingRequest(
-  request: APIRequestContext,
-  regionName: string,
-  aoName: string,
-): Promise<string> {
-  const key = API_KEYS.noRole;
-  const regionId = await resolveOrgId(request, key, "region", regionName);
-  const aoId = await resolveOrgId(request, key, "ao", aoName);
-  const eventTypeId = await resolveBootcampTypeId(request, key);
-
-  const submitRes = await submitUpdateRequest(
-    request,
-    key,
-    createEventPayload({
-      regionId,
-      eventTypeId,
-      suffix: uniqueSuffix(),
-      aoId,
-      aoName,
-    }),
-  );
-  expect(submitRes.status()).toBe(200);
-  const submitted = (await submitRes.json()) as SubmitResponse;
-  expect(submitted.status).toBe("pending");
-  const requestId = submitted.updateRequest?.id;
-  expect(requestId).toBeTruthy();
-  return requestId!;
+/** Read a request's status back with a principal that can always see it. */
+async function getRequestStatus(request: APIRequestContext, id: string) {
+  const res = await request.get(`${API}/v1/request/id/${id}`, {
+    headers: headers(KEYS.nationAdmin),
+  });
+  expect(res.ok()).toBe(true);
+  const body = (await res.json()) as {
+    request: { status: string } | null;
+  };
+  expect(body.request, `request ${id} should exist`).toBeTruthy();
+  return body.request?.status;
 }
 
-function rejectSubmission(
+async function rejectRequest(
   request: APIRequestContext,
-  apiKey: string,
-  requestId: string,
+  key: string,
+  id: string,
 ) {
-  return request.post(`${API_URL}/v1/request/reject-submission`, {
-    headers: headersFor(apiKey),
-    data: { id: requestId },
-    timeout: REQUEST_TIMEOUT_MS,
+  return request.post(`${API}/v1/request/reject-submission`, {
+    headers: headers(key),
+    data: { id },
   });
 }
 
-test.describe("update-request RBAC (direct api)", () => {
-  test.beforeAll(() => {
-    if (!API_URL) {
-      throw new Error(
-        "E2E_API_URL is required but not set. Point it at the api deployment " +
-          "under test, e.g. " +
-          "E2E_API_URL=https://pr-123-api-<project>.us-central1.run.app " +
-          "pnpm test:e2e",
-      );
-    }
+/** Whether an event with this exact name exists in live data. */
+async function liveEventExists(request: APIRequestContext, name: string) {
+  const res = await request.get(`${API}/v1/event`, {
+    params: { searchTerm: name },
+    headers: headers(KEYS.readOnly),
   });
+  expect(res.ok()).toBe(true);
+  const { events } = (await res.json()) as { events: { name: string }[] };
+  return events.some((e) => e.name === name);
+}
 
-  test("non-editor submit is recorded as a pending request (AC-8)", async ({
+test.describe("update-request RBAC (API)", () => {
+  test("non-editor submit is recorded pending with no live change", async ({
     request,
   }) => {
-    const key = API_KEYS.noRole;
-    const regionId = await resolveOrgId(request, key, "region", "Boone");
-    const aoId = await resolveOrgId(request, key, "ao", "The Dark Tower");
-    const eventTypeId = await resolveBootcampTypeId(request, key);
-
-    // A no-role key targeting a seeded Boone AO: valid submission, but the
-    // submitter is not an editor of the affected region → pending.
-    const res = await submitUpdateRequest(
+    const refs = await resolveSeedRefs(request);
+    const eventName = `E2E RBAC pending ${uniqueSuffix()}`;
+    const res = await submitCreateEvent(
       request,
-      key,
-      createEventPayload({
-        regionId,
-        eventTypeId,
-        suffix: uniqueSuffix(),
-        aoId,
-        aoName: "The Dark Tower",
-      }),
+      KEYS.readOnly,
+      createEventPayload({ refs, region: "charlotte", eventName }),
     );
     expect(res.status()).toBe(200);
-    const body = (await res.json()) as SubmitResponse;
+    const body = (await res.json()) as {
+      status: string;
+      updateRequest: { id: string };
+    };
+
+    // Recorded pending, not auto-applied…
     expect(body.status).toBe("pending");
-    expect(body.updateRequest?.id).toBeTruthy();
-    expect(body.updateRequest?.status).toBe("pending");
+    expect(await getRequestStatus(request, body.updateRequest.id)).toBe(
+      "pending",
+    );
+    // …and no live map data changed.
+    expect(await liveEventExists(request, eventName)).toBe(false);
   });
 
-  test("editor submit is auto-applied (AC-9)", async ({ request }) => {
-    const key = API_KEYS.editor;
-    const regionId = await resolveOrgId(request, key, "region", "Boone");
-    const eventTypeId = await resolveBootcampTypeId(request, key);
-
-    // local-api-key holds editor on the Nation org — an ancestor of every
-    // seeded region — so checkHasRoleOnOrg passes for Boone and the change
-    // applies immediately (a new location + AO + event, uniquely named).
-    const res = await submitUpdateRequest(
+  test("nation editor submit is auto-applied", async ({ request }) => {
+    const refs = await resolveSeedRefs(request);
+    const eventName = `E2E RBAC applied ${uniqueSuffix()}`;
+    const res = await submitCreateEvent(
       request,
-      key,
-      createEventPayload({ regionId, eventTypeId, suffix: uniqueSuffix() }),
+      KEYS.nationEditor,
+      createEventPayload({ refs, region: "charlotte", eventName }),
     );
     expect(res.status()).toBe(200);
-    const body = (await res.json()) as SubmitResponse;
+    const body = (await res.json()) as {
+      status: string;
+      updateRequest: { id: string };
+    };
+
+    // Approved immediately, and the change is live.
     expect(body.status).toBe("approved");
-    expect(body.updateRequest?.status).toBe("approved");
+    expect(await getRequestStatus(request, body.updateRequest.id)).toBe(
+      "approved",
+    );
+    expect(await liveEventExists(request, eventName)).toBe(true);
   });
 
-  test("non-editor cannot reject; request stays pending (§5 reject row)", async ({
+  test("non-editor cannot reject and the request stays pending", async ({
     request,
   }) => {
-    // Arrange: a pending request in F3 Charlotte, submitted by the no-role key.
-    const requestId = await submitPendingRequest(
+    const refs = await resolveSeedRefs(request);
+    const eventName = `E2E RBAC noreject ${uniqueSuffix()}`;
+    const submitRes = await submitCreateEvent(
       request,
-      "F3 Charlotte",
-      "The Colosseum",
+      KEYS.readOnly,
+      createEventPayload({ refs, region: "charlotte", eventName }),
     );
+    expect(submitRes.status()).toBe(200);
+    const { updateRequest } = (await submitRes.json()) as {
+      updateRequest: { id: string };
+    };
 
-    // Act: the same no-role key — a principal with editor on NO org — is
-    // stopped at the editorProcedure gate before any per-region check.
-    const rejectRes = await rejectSubmission(
+    // editorProcedure denies principals without any editor/admin role.
+    const rejectRes = await rejectRequest(
       request,
-      API_KEYS.noRole,
-      requestId,
+      KEYS.readOnly,
+      updateRequest.id,
     );
     expect(rejectRes.status()).toBe(401);
-    const rejectBody = (await rejectRes.json()) as OrpcErrorBody;
-    expect(rejectBody.code).toBe("UNAUTHORIZED");
-
-    // Assert: the request is still pending (checked with the admin key,
-    // whose nation-scoped admin role satisfies editorProcedure).
-    const byId = await getJson<RequestByIdResponse>(
-      request,
-      `/v1/request/id/${requestId}`,
-      API_KEYS.admin,
-    );
-    expect(byId.request?.status).toBe("pending");
+    expect(await getRequestStatus(request, updateRequest.id)).toBe("pending");
   });
 
-  test("editor of another region cannot reject; request stays pending (AC-15)", async ({
+  test("cross-region editor cannot reject; same editor can reject in their own region (AC-15)", async ({
     request,
   }) => {
-    // Arrange: a pending request in F3 Charlotte (region R).
-    const requestId = await submitPendingRequest(
-      request,
-      "F3 Charlotte",
-      "The Colosseum",
-    );
+    const refs = await resolveSeedRefs(request);
 
-    // Act: the Boone-scoped editor (region S) attempts the reject. It clears
-    // the editorProcedure gate (editor on SOME org) but Boone is not an
-    // ancestor of F3 Charlotte, so rejectSubmission's checkHasRoleOnOrg
-    // denies with the region-specific UNAUTHORIZED.
-    const rejectRes = await rejectSubmission(
+    // A pending request in F3 Charlotte…
+    const charlotteName = `E2E RBAC xregion ${uniqueSuffix()}`;
+    const charlotteRes = await submitCreateEvent(
       request,
-      API_KEYS.booneEditor,
-      requestId,
-    );
-    expect(rejectRes.status()).toBe(401);
-    const rejectBody = (await rejectRes.json()) as OrpcErrorBody;
-    expect(rejectBody.code).toBe("UNAUTHORIZED");
-    // Substring, not exact-match: assert it identifies the region-authorization
-    // failure without pinning the test to the exact copy.
-    expect(rejectBody.message).toMatch(/not authorized.*region/i);
-
-    // Assert: the request is still pending.
-    const byId = await getJson<RequestByIdResponse>(
-      request,
-      `/v1/request/id/${requestId}`,
-      API_KEYS.admin,
-    );
-    expect(byId.request?.status).toBe("pending");
-  });
-
-  test("region-scoped editor CAN reject inside its own region (AC-15 positive control)", async ({
-    request,
-  }) => {
-    // Arrange: a pending request in Boone — the region the key is scoped to.
-    const requestId = await submitPendingRequest(
-      request,
-      "Boone",
-      "The Dark Tower",
-    );
-
-    // Act: the Boone-scoped editor rejects a Boone-region request. This
-    // proves the AC-15 denial above is region scoping, not a broken key.
-    const rejectRes = await rejectSubmission(
-      request,
-      API_KEYS.booneEditor,
-      requestId,
-    );
-    expect(rejectRes.status()).toBe(200);
-    const rejectBody = (await rejectRes.json()) as { status?: string };
-    expect(rejectBody.status).toBe("rejected");
-
-    // Assert: the request is persisted as rejected.
-    const byId = await getJson<RequestByIdResponse>(
-      request,
-      `/v1/request/id/${requestId}`,
-      API_KEYS.admin,
-    );
-    expect(byId.request?.status).toBe("rejected");
-  });
-
-  test("unauthenticated submit is denied (§5 row 2)", async ({ request }) => {
-    // A structurally valid payload with NO bearer token. regionId 0 never
-    // exists, but protectedProcedure rejects before any handler logic runs.
-    const res = await submitUpdateRequest(
-      request,
-      null,
+      KEYS.readOnly,
       createEventPayload({
-        regionId: 0,
-        eventTypeId: 1,
-        suffix: uniqueSuffix(),
+        refs,
+        region: "charlotte",
+        eventName: charlotteName,
       }),
+    );
+    expect(charlotteRes.status()).toBe(200);
+    const charlotteRequest = (
+      (await charlotteRes.json()) as { updateRequest: { id: string } }
+    ).updateRequest;
+
+    // …cannot be rejected by an editor scoped to the Boone region only.
+    const denied = await rejectRequest(
+      request,
+      KEYS.booneEditor,
+      charlotteRequest.id,
+    );
+    expect(denied.status()).toBe(401);
+    expect(await getRequestStatus(request, charlotteRequest.id)).toBe(
+      "pending",
+    );
+
+    // Positive control: the same key CAN reject a Boone-region request.
+    const booneName = `E2E RBAC boonereject ${uniqueSuffix()}`;
+    const booneRes = await submitCreateEvent(
+      request,
+      KEYS.readOnly,
+      createEventPayload({ refs, region: "boone", eventName: booneName }),
+    );
+    expect(booneRes.status()).toBe(200);
+    const booneRequest = (
+      (await booneRes.json()) as { updateRequest: { id: string } }
+    ).updateRequest;
+
+    const allowed = await rejectRequest(
+      request,
+      KEYS.booneEditor,
+      booneRequest.id,
+    );
+    expect(allowed.status()).toBe(200);
+    expect(((await allowed.json()) as { status: string }).status).toBe(
+      "rejected",
+    );
+    expect(await getRequestStatus(request, booneRequest.id)).toBe("rejected");
+    // Reject never applies the change.
+    expect(await liveEventExists(request, booneName)).toBe(false);
+  });
+
+  test("unauthenticated submit is rejected", async ({ request }) => {
+    const refs = await resolveSeedRefs(request);
+    const eventName = `E2E RBAC unauthed ${uniqueSuffix()}`;
+    // An invalid bearer resolves to no session (see the local-dev caveat in
+    // the header about why this — not a missing header — is the deterministic
+    // unauthenticated principal).
+    const res = await submitCreateEvent(
+      request,
+      "not-a-real-key",
+      createEventPayload({ refs, region: "charlotte", eventName }),
     );
     expect(res.status()).toBe(401);
-    const body = (await res.json()) as OrpcErrorBody;
-    expect(body.code).toBe("UNAUTHORIZED");
+    expect(await liveEventExists(request, eventName)).toBe(false);
   });
 });
