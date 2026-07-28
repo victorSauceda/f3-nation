@@ -339,7 +339,13 @@ jobs:
     # the `preview` label, never on close. Also needs sync-maps-key so the
     # browser Maps key allows this preview's referrer before the suite loads it.
     needs: [deploy, sync-maps-key]
+    # Explicit result checks + !cancelled(): sync-maps-key runs via !cancelled()
+    # with skipped upstreams (teardown/reaper), which poisons the implicit
+    # success() gate GitHub would otherwise apply and wrongly skips this job.
     if: >-
+      !cancelled() &&
+      needs.deploy.result == 'success' &&
+      needs.sync-maps-key.result == 'success' &&
       github.event_name == 'pull_request' &&
       github.event.action != 'closed' &&
       contains(github.event.pull_request.labels.*.name, 'preview') &&
@@ -382,7 +388,13 @@ jobs:
     # surfaced via the uploaded artifacts and triaged, never merge-blocking.
     # Needs sync-maps-key too (see e2e-blocking) so the Maps referrer is set.
     needs: [deploy, sync-maps-key]
+    # Explicit result checks + !cancelled() — see e2e-blocking: avoids the
+    # implicit success() gate wrongly skipping this after sync-maps-key runs
+    # via !cancelled() with skipped teardown/reaper upstreams.
     if: >-
+      !cancelled() &&
+      needs.deploy.result == 'success' &&
+      needs.sync-maps-key.result == 'success' &&
       github.event_name == 'pull_request' &&
       github.event.action != 'closed' &&
       contains(github.event.pull_request.labels.*.name, 'preview') &&
