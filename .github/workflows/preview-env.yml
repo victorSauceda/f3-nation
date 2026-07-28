@@ -257,19 +257,6 @@ jobs:
             --set-env-vars "^;^F3_CHANNEL=branch;NEXT_PUBLIC_CHANNEL=branch;F3_API_BASE_URL=${{ steps.meta.outputs.url_api }};F3_MAP_BASE_URL=${{ steps.meta.outputs.url_map }};F3_MAP_API_KEY=local-map-key;F3_GOOGLE_API_KEY=${MAPS_KEY};AUTH_SECRET=preview-auth-secret-placeholder-32c;EMAIL_SERVER=smtp://user:pass@localhost:587;EMAIL_FROM=preview@example.com;EMAIL_ADMIN_DESTINATIONS=preview@example.com;API_KEY=local-api-key;SUPER_ADMIN_API_KEY=preview-super-admin-key;NEXT_PUBLIC_API_URL=${{ steps.meta.outputs.url_api }};NEXT_PUBLIC_MAP_URL=${{ steps.meta.outputs.url_map }};NEXT_PUBLIC_AUTH_URL=${{ steps.meta.outputs.url_auth }};NEXT_PUBLIC_GOOGLE_API_KEY=${MAPS_KEY};NEXT_PUBLIC_MAP_API_KEY=preview-map-key;NEXT_PUBLIC_POSTHOG_KEY=${{ secrets.PREVIEW_POSTHOG_KEY }};GCS_CREDENTIALS=${FAKE_GCS}" \
             --quiet
 
-      - name: Sync Maps key referrers to live previews
-        run: |
-          PROJECT_NUMBER=$(gcloud projects describe "${PROJECT}" --format 'value(projectNumber)')
-          # Placeholder keeps the restriction list non-empty (an empty list
-          # would make the key unrestricted).
-          LIST="https://placeholder.invalid/*"
-          for S in $(gcloud run services list --region "${REGION}" --project "${PROJECT}" \
-              --filter "metadata.labels.preview-env=true" --format 'value(metadata.name)' | grep -- '-map$'); do
-            LIST="${LIST},https://${S}-${PROJECT_NUMBER}.${REGION}.run.app/*"
-          done
-          gcloud services api-keys update "${MAPS_KEY_NAME}" --project "${PROJECT}" \
-            --allowed-referrers="${LIST}" --quiet
-
       - name: Smoke test
         run: |
           # api liveness (root redirects to /docs). Scale-to-zero, so the first
@@ -345,8 +332,9 @@ jobs:
   e2e-blocking:
     # Blocking-tier Playwright suite (F3-59) against the freshly deployed
     # preview environment. Same gating as deploy: PRs from this repo carrying
-    # the `preview` label, never on close.
-    needs: deploy
+    # the `preview` label, never on close. Also needs sync-maps-key so the
+    # browser Maps key allows this preview's referrer before the suite loads it.
+    needs: [deploy, sync-maps-key]
     if: >-
       github.event_name == 'pull_request' &&
       github.event.action != 'closed' &&
@@ -388,7 +376,8 @@ jobs:
     # Advisory-tier Playwright suite (F3-60). continue-on-error keeps the
     # check (and the whole run) green even when it fails — failures are
     # surfaced via the uploaded artifacts and triaged, never merge-blocking.
-    needs: deploy
+    # Needs sync-maps-key too (see e2e-blocking) so the Maps referrer is set.
+    needs: [deploy, sync-maps-key]
     if: >-
       github.event_name == 'pull_request' &&
       github.event.action != 'closed' &&
@@ -455,17 +444,6 @@ jobs:
             fi
           done
 
-      - name: Sync Maps key referrers to live previews
-        run: |
-          PROJECT_NUMBER=$(gcloud projects describe "${PROJECT}" --format 'value(projectNumber)')
-          LIST="https://placeholder.invalid/*"
-          for S in $(gcloud run services list --region "${REGION}" --project "${PROJECT}" \
-              --filter "metadata.labels.preview-env=true" --format 'value(metadata.name)' | grep -- '-map$'); do
-            LIST="${LIST},https://${S}-${PROJECT_NUMBER}.${REGION}.run.app/*"
-          done
-          gcloud services api-keys update "${MAPS_KEY_NAME}" --project "${PROJECT}" \
-            --allowed-referrers="${LIST}" --quiet
-
   reaper:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -495,9 +473,44 @@ jobs:
             echo "Reaped ${SERVICE}"
           done
 
-      - name: Sync Maps key referrers to live previews
+  # Single, serialized reconcile of the shared Maps API key's allowed-referrer
+  # list — replaces the three inline copies that previously ran in deploy /
+  # teardown / reaper. Runs only when one of those paths actually succeeded
+  # (never on a non-preview PR where all three skip), and the fixed
+  # `preview-maps-key` concurrency group serializes it across ALL preview-env
+  # runs so concurrent deploys/teardowns can't clobber each other's referrer
+  # list. Idempotent: it rebuilds the full list from the live preview map
+  # services. e2e-blocking/e2e-advisory depend on it so the browser Maps key
+  # allows the new preview before the suites load it.
+  sync-maps-key:
+    needs: [deploy, teardown, reaper]
+    if: >-
+      !cancelled() &&
+      (needs.deploy.result == 'success' ||
+      needs.teardown.result == 'success' ||
+      needs.reaper.result == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: preview-maps-key
+      cancel-in-progress: false
+    steps:
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.WIF_SA }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Reconcile Maps key referrers to live previews
         run: |
           PROJECT_NUMBER=$(gcloud projects describe "${PROJECT}" --format 'value(projectNumber)')
+          # Placeholder keeps the restriction list non-empty (an empty list
+          # would make the key unrestricted).
           LIST="https://placeholder.invalid/*"
           for S in $(gcloud run services list --region "${REGION}" --project "${PROJECT}" \
               --filter "metadata.labels.preview-env=true" --format 'value(metadata.name)' | grep -- '-map$'); do
