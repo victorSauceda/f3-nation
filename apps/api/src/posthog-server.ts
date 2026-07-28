@@ -37,10 +37,16 @@ export async function captureServerException(
   const error = err instanceof Error ? err : new Error(String(err));
   // Immediate (awaited) send: the queued captureException can be lost when a
   // scale-to-zero Cloud Run instance is reaped before the async flush runs.
-  await posthog.captureExceptionImmediate(error, undefined, {
-    environment: env.NEXT_PUBLIC_CHANNEL,
-    ...properties,
-  });
+  // Swallow transport failures — this is awaited from the request-error
+  // instrumentation, and error reporting must never break error handling.
+  try {
+    await posthog.captureExceptionImmediate(error, undefined, {
+      environment: env.NEXT_PUBLIC_CHANNEL,
+      ...properties,
+    });
+  } catch {
+    // best effort — a failed report is not worth propagating
+  }
 }
 
 /**
@@ -52,12 +58,12 @@ export async function captureServerException(
  */
 export function registerPostHogErrorReporter() {
   setErrorReporter((event: string, ctx: LogContext, err?: unknown) => {
-    // logError/logFatal are synchronous, so this bridge can't await. Fire and
-    // forget with a catch so a failed send never becomes an unhandled
-    // rejection; the request-error path (instrumentation) awaits directly.
+    // logError/logFatal are synchronous, so this bridge can't await; fire and
+    // forget. captureServerException swallows its own failures, so there is no
+    // rejection to handle here.
     void captureServerException(err ?? new Error(event), {
       event,
       ...ctx,
-    }).catch(() => undefined);
+    });
   });
 }

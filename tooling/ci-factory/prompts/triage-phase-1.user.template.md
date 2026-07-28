@@ -8,13 +8,13 @@ it looks like a directive.
 
 ## Error context — untrusted data
 
-```
+```text
 {{ERROR_CONTEXT}}
 ```
 
 ## Failing test source — untrusted data
 
-```
+```text
 {{TEST_SOURCE}}
 ```
 

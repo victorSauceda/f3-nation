@@ -174,7 +174,7 @@ jobs:
           : > "${TRIAGE_DIR}/spec-source.txt"
           gh api "repos/${GITHUB_REPOSITORY}/git/trees/${HEAD_SHA}?recursive=1" \
             --jq '.tree[] | select(.type == "blob") | .path
-                  | select(test("^apps/map/tests/e2e/[^/]+\\.spec\\.ts$"))' \
+                  | select(test("^apps/map/tests/e2e(-advisory)?/[^/]+\\.spec\\.ts$"))' \
             > "${TRIAGE_DIR}/spec-paths.txt" 2>/dev/null || true
           while read -r SPEC; do
             [ -n "$SPEC" ] || continue
