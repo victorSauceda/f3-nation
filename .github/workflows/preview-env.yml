@@ -234,8 +234,16 @@ jobs:
             sleep 5
           done
 
-      - name: Deploy map
+      - name: Deploy map + DB sidecar
         env:
+          SERVICE_MAP: ${{ steps.meta.outputs.service_map }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          MAP_IMAGE: ${{ steps.meta.outputs.image_map }}
+          DB_IMAGE: ${{ steps.meta.outputs.image_db }}
+          API_URL: ${{ steps.meta.outputs.url_api }}
+          MAP_URL: ${{ steps.meta.outputs.url_map }}
+          AUTH_URL: ${{ steps.meta.outputs.url_auth }}
+          NEXT_PUBLIC_POSTHOG_KEY: ${{ secrets.PREVIEW_POSTHOG_KEY }}
           # Browser Maps key — safe to embed by design: referrer-locked to
           # pr-*-map-<project>.run.app, API-restricted to Maps JS + Places,
           # and living in the budget-capped sandbox project.
@@ -247,19 +255,25 @@ jobs:
           # committing the equivalent base64 blob trips high-entropy
           # detectors (GitGuardian, 2026-07-06).
           FAKE_GCS=$(printf '{"client_email":"fake-not-a-real-credential@preview.invalid","private_key":"THIS-IS-A-FAKE-PLACEHOLDER-FOR-PREVIEW-ENVS"}' | base64 -w0)
-          gcloud run deploy "${{ steps.meta.outputs.service_map }}" \
-            --image "${{ steps.meta.outputs.image_map }}" \
-            --region "${REGION}" \
-            --project "${PROJECT}" \
-            --service-account "${RUNTIME_SA}" \
-            --allow-unauthenticated \
-            --min-instances=0 \
-            --max-instances=1 \
-            --cpu=1 \
-            --memory=1Gi \
-            --labels "preview-env=true,pr-number=${{ github.event.pull_request.number }}" \
-            --set-env-vars "^;^F3_CHANNEL=branch;NEXT_PUBLIC_CHANNEL=branch;F3_API_BASE_URL=${{ steps.meta.outputs.url_api }};F3_MAP_BASE_URL=${{ steps.meta.outputs.url_map }};F3_MAP_API_KEY=local-map-key;F3_GOOGLE_API_KEY=${MAPS_KEY};AUTH_SECRET=preview-auth-secret-placeholder-32c;EMAIL_SERVER=smtp://user:pass@localhost:587;EMAIL_FROM=preview@example.com;EMAIL_ADMIN_DESTINATIONS=preview@example.com;API_KEY=local-api-key;SUPER_ADMIN_API_KEY=preview-super-admin-key;NEXT_PUBLIC_API_URL=${{ steps.meta.outputs.url_api }};NEXT_PUBLIC_MAP_URL=${{ steps.meta.outputs.url_map }};NEXT_PUBLIC_AUTH_URL=${{ steps.meta.outputs.url_auth }};NEXT_PUBLIC_GOOGLE_API_KEY=${MAPS_KEY};NEXT_PUBLIC_MAP_API_KEY=preview-map-key;NEXT_PUBLIC_POSTHOG_KEY=${{ secrets.PREVIEW_POSTHOG_KEY }};GCS_CREDENTIALS=${FAKE_GCS}" \
-            --quiet
+          export FAKE_GCS
+          # The map runs a DB sidecar (like api/auth) because @acme/auth reaches
+          # the database during signed-in SSR — see docs/PREVIEW_AUTH.md.
+          envsubst '${SERVICE_MAP} ${PR_NUMBER} ${RUNTIME_SA} ${MAP_IMAGE} ${DB_IMAGE} ${API_URL} ${MAP_URL} ${AUTH_URL} ${MAPS_KEY} ${NEXT_PUBLIC_POSTHOG_KEY} ${FAKE_GCS}' \
+            < .github/preview/map-service.template.yaml > /tmp/map-service.yaml
+          gcloud run services replace /tmp/map-service.yaml \
+            --region "${REGION}" --project "${PROJECT}" --quiet
+          gcloud run services add-iam-policy-binding "${SERVICE_MAP}" \
+            --region "${REGION}" --project "${PROJECT}" \
+            --member=allUsers --role=roles/run.invoker --quiet
+          # services replace returns before the revision is ready — poll.
+          for i in $(seq 1 60); do
+            READY=$(gcloud run services describe "${SERVICE_MAP}" \
+              --region "${REGION}" --project "${PROJECT}" \
+              --format 'value(status.conditions[0].status)')
+            [ "${READY}" = "True" ] && break
+            [ "$i" = "60" ] && { echo "map service never became ready"; exit 1; }
+            sleep 5
+          done
 
       - name: Smoke test
         run: |
