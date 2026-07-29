@@ -259,6 +259,14 @@ async function runSetBased(
     update: postgres.PendingQuery<postgres.Row[]>;
   },
 ): Promise<void> {
+  // The secret/session/token lists carry both plural (repo schema) and
+  // singular (better-auth) table names; only one family exists in any given
+  // target, so an absent member must be skipped rather than crash the run
+  // with an undefined-table error — same contract as truncateTable().
+  if (!(await tableExists(sql, opts.table))) {
+    addSummary(opts.table, opts.column, `${opts.action} (absent — skipped)`, 0);
+    return;
+  }
   if (DRY_RUN) {
     const [row] = await sql`
       SELECT count(*)::int AS n FROM ${sql(opts.table)} WHERE ${opts.countWhere}`;
