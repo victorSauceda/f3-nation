@@ -95,14 +95,17 @@ jobs:
       - name: Collect inputs (diff, specs, CodeRabbit comments)
         if: steps.dedupe.outputs.proceed == 'true'
         run: |
-          # Diff against the merge base with main, capped at ~120KB so the
-          # top-tier calls stay inside the cost envelope.
+          # Diff against the merge base with main, capped at ~512KB. The
+          # top-tier reviewers (opus / gpt-5.5) have large context windows and
+          # comfortably fit this; the previous ~120KB cap silently truncated
+          # big pipeline PRs, hiding already-fixed code and yielding stale
+          # findings (observed dogfooding F3-50 on a 442KB diff).
           gh pr diff "${PR}" -R "${GITHUB_REPOSITORY}" > "${REVIEW_DIR}/full.diff"
-          head -c 122880 "${REVIEW_DIR}/full.diff" > "${REVIEW_DIR}/diff.txt"
+          head -c 524288 "${REVIEW_DIR}/full.diff" > "${REVIEW_DIR}/diff.txt"
           TRUNC_NOTE=""
-          if [ "$(wc -c < "${REVIEW_DIR}/full.diff")" -gt 122880 ]; then
-            TRUNC_NOTE="Diff truncated at 120KB — findings cover the truncated portion only."
-            echo "Diff truncated at 120KB."
+          if [ "$(wc -c < "${REVIEW_DIR}/full.diff")" -gt 524288 ]; then
+            TRUNC_NOTE="Diff truncated at 512KB — findings cover the truncated portion only."
+            echo "Diff truncated at 512KB."
           fi
           echo "trunc_note=${TRUNC_NOTE}" >> "$GITHUB_ENV"
 

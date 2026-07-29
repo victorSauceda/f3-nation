@@ -3,9 +3,11 @@ export interface ChatCompletionRequest {
   userPrompt: string;
 }
 
-/** Per-request inference timeout. Large diffs on a slow tier still fit; a hung
- * endpoint is aborted rather than stalling the whole CI job. */
-const INFERENCE_TIMEOUT_MS = 120_000;
+/** Per-request inference timeout. A full-size review over a large diff on a
+ * top reasoning tier can run past two minutes (a 120KB diff measured ~3min end
+ * to end), so the old 120s cap aborted legitimate reviews; a hung endpoint is
+ * still bounded rather than stalling the whole CI job. */
+const INFERENCE_TIMEOUT_MS = 300_000;
 
 export interface InferenceConfig {
   apiKey: string;
