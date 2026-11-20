@@ -12,7 +12,10 @@ import { ProviderId } from "@acme/shared/common/enums";
 
 import { isDevModeSignInAllowed } from "./lib/dev-mode";
 import { emailProvider } from "./lib/email-provider";
-import { MDPGDrizzleAdapter } from "./lib/md-pg-drizzzle-adapter";
+import {
+  limitVerificationEmails,
+  MDPGDrizzleAdapter,
+} from "./lib/md-pg-drizzzle-adapter";
 import OtpProvider from "./lib/otp-provider";
 import { logWarn } from "./logger";
 import type { UserRole } from "@acme/shared/app/enums";
@@ -216,12 +219,14 @@ export const authConfig: NextAuthConfig = {
   },
   providers,
   callbacks: {
+    signIn: limitVerificationEmails(db),
     // `session` is deliberately not destructured: on `trigger === "update"` it
     // is the body of a POST to /api/auth/session, which any signed-in user can
     // send with whatever roles they like. Nothing in it may reach the token.
-    async jwt({ token, user, trigger }) {
+    async jwt({ token, user, account, trigger }) {
       // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- next-auth passes `user` only on sign-in, despite its type
       if (user) {
+        token.devMode = account?.provider === ProviderId.DEV_MODE;
         token.id = user.id;
         token.email = user.email ?? undefined;
         token.name = user.name;
@@ -260,6 +265,7 @@ export const authConfig: NextAuthConfig = {
         id: token.id as string | undefined,
         email: token.email,
         name: token.name as string | undefined,
+        devMode: typeof token.devMode === "boolean" ? token.devMode : undefined,
         roles: token.roles as
           { orgId: number; orgName: string; roleName: UserRole }[] | undefined,
       };

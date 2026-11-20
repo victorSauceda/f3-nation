@@ -1,6 +1,9 @@
 # ---------- Stage 1: Prune monorepo ----------
 ARG TURBO_VERSION=2
-FROM node:24.22.1-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS builder
+# Node 25+ images no longer bundle Corepack; install it so pnpm comes from
+# the root packageManager pin (version and hash).
+ARG COREPACK_VERSION=0.36.0
+FROM node:26.13.0-alpine@sha256:8996bb5821d62a8fd9bb27c1cb07462f3fdce6e47d640c6a881ead0b064ce216 AS builder
 ARG TURBO_VERSION
 
 ENV TURBO_TELEMETRY_DISABLED=1
@@ -15,7 +18,7 @@ COPY . .
 RUN turbo prune f3-me --docker
 
 # ---------- Stage 2: Install + build ----------
-FROM node:24.22.1-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS installer
+FROM node:26.13.0-alpine@sha256:8996bb5821d62a8fd9bb27c1cb07462f3fdce6e47d640c6a881ead0b064ce216 AS installer
 ARG TURBO_VERSION
 
 ENV NEXT_TELEMETRY_DISABLED=1
@@ -28,7 +31,8 @@ ENV SKIP_ENV_VALIDATION=true
 RUN apk add --no-cache libc6-compat
 WORKDIR /app
 
-RUN corepack enable
+ARG COREPACK_VERSION
+RUN npm install -g corepack@${COREPACK_VERSION} && corepack enable
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 
 # Install dependencies from pruned lockfile
@@ -61,7 +65,7 @@ RUN pnpm turbo build --filter=f3-me
 RUN test -n "$(find apps/me/.next/standalone -name 'libvips-cpp*')"
 
 # ---------- Stage 3: Production runner ----------
-FROM node:24.22.1-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS runner
+FROM node:26.13.0-alpine@sha256:8996bb5821d62a8fd9bb27c1cb07462f3fdce6e47d640c6a881ead0b064ce216 AS runner
 
 RUN apk add --no-cache libc6-compat
 WORKDIR /app

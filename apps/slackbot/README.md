@@ -68,7 +68,7 @@ only synthetic names, contact details, and emergency information:
 
 ### Start the local apps with Slackbot
 
-In the app manifest, there is a setting called socket_mode_enabled that is set to true. This tells Slack to connect to the app locally on your machine (port 3006).
+In the app manifest, there is a setting called socket_mode_enabled that is set to true. The bot connects out to Slack over a websocket, so Slack never needs to reach your machine.
 
 From the repo root:
 
@@ -78,11 +78,11 @@ pnpm dev --include-py
 
 Slackbot is opt-in for root dev startup because it needs the Python environment and Slack credentials. At the very least, you will need to also run the API app.
 
-- Slackbot local URL: http://localhost:3006
+- Slackbot health check: http://localhost:3007 (`F3_SLACKBOT_PORT`, which follows the checkout's slot like the other apps)
 
-### Uploading Files (NOT IMPLEMENTED)
+### Uploading Files
 
-Slackbot allows you to upload user avatar images and region logos. Right now the file upload functionality does not work when running the app locally. Maybe on day.
+Photo, avatar and logo uploads and calendar images are stored in the local GCS emulator when `GCS_EMULATOR_HOST` is set (the `.env.example` default; run `pnpm docker:up` first). Slack can't download images from `localhost`, so locally the bot posts a link to each image instead of embedding it. See [GCS emulator § Slackbot](../../docs/LOCAL_DEV_DOCKER.md#slackbot).
 
 ### First steps
 
@@ -94,6 +94,21 @@ Once the app is running, you will want to take some admin actions to make it use
 4. I would recommend that you set channels for preblasts and backblasts. You can do that by either:
    1. Going to `/f3-nation-settings` -> `Backblast & Preblast Settings` and setting for your whole space
    2. Setting them individually by AO by going to `/f3-nation-settings` -> `Calendar Management` -> `Manage AOs` -> `Edit` and setting the channel for each
+
+### Calendar special-event window
+
+`/f3-nation-settings` → **Calendar Management** → **General Calendar Settings** →
+**Special Days Out** controls the upcoming highlighted events included in calendar
+posts. A positive value includes events through that many days ahead, an empty
+value applies no date cutoff, and `0` hides special events. Posts include the
+earliest upcoming highlighted events, capped by `create_special_events_blocks`
+in [`scripts/calendar_images.py`](scripts/calendar_images.py).
+
+When no events remain in the display window, the post omits the Special Events
+header and section, because Slack rejects a section with empty text. If the
+calendar post fails, that region's update rolls back and the new calendar image
+references and post timestamp are not saved. The rollback does not undo settings
+already saved from the form.
 
 ## Step debugging
 
@@ -135,7 +150,7 @@ Coverage is printed in the terminal and saved to `coverage/coverage.json`, with
 its measurement database at `coverage/.coverage`. These generated files are
 ignored by Git and included in Turbo's existing test outputs.
 
-For a focused test run without collecting coverage, run `uv run pytest` with a
+For a focused test run without collecting coverage, run `uv run --group charts pytest` with a
 test path from this directory. Use the `pnpm` test task above to verify the
 coverage gate used by CI.
 
@@ -265,3 +280,28 @@ the current service or job does not retrofit older revisions/templates. These
 are operator-run commands for manual changes/rollback, not an automated
 cleanup. The app does not automatically delete synthetic users or clean up
 historical profile data.
+
+### Scheduled-job logging
+
+The hourly entrypoint uses Cloud Logging JSON records in deployment and a stream
+handler in local development, with `LOG_LEVEL=DEBUG` selecting DEBUG and other
+values selecting INFO. Slack member synchronization records one summary per
+completed workspace-region pass, including the
+number of identities created or linked, without member profile fields. Cached
+identity-link failures retain the cached row and report bounded SQLSTATE and
+allowlisted constraint diagnostics for database errors.
+
+### Unlinked workspace identities
+
+In production, an identity without a usable member email or established F3 link
+stays unlinked. Calendar browsing, help and downrange remain available.
+Account-dependent writes require a verified link and report when the app needs
+access to a member's email. Sync refreshes unlinked display profiles and retries
+linking when email becomes available; it does not create placeholder F3 accounts.
+Direct-email Downrange invitations require a usable email address. FNG creation
+can proceed without linking its optional battle buddy when the actor is unlinked.
+
+The disposable identity PostgreSQL tests run with `SLACKBOT_POSTGRES_TESTS=1`.
+`SLACKBOT_POSTGRES_IMAGE` optionally overrides their pinned local PostgreSQL
+image; CI supplies the same mirrored image as its database service. Every test
+container is removed by its fixture.

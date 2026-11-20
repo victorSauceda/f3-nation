@@ -20,22 +20,26 @@ PR opened/updated
        ├─ test-coverage · pnpm test (Vitest vs postgres:18)  [required to merge]
        ├─ security-audit  pnpm audit --prod --level=high    [required to merge]
        ├─ db-schema-sync · Drizzle migration drift check    [required to merge]
-       ├─ docker-build ·· 7 app images + Slackbot scripts  [advisory]
+       ├─ docker-build ·· app + job images (matrix)        [advisory]
        ├─ recent-package-watch · npm publish-date report    [advisory, comment]
        │
        ├─ (reserved) preview-env ·· per-PR Cloud Run deploy, opt-in label
        └─ (reserved) e2e-blocking · Playwright critical paths vs preview env
   │
-merge to main (ruleset "main": PR required, the eight checks above required,
-  │            no force-push, no deletion)
+merge queue ("Merge when ready"; PR + every PR queued ahead of it on main)
+  ├─ pr-title.yml ······· reports green without linting (title linted on the PR)
+  └─ ci.yml ············· full-workspace required checks; a failure ejects the PR
+  │
+merge to main (ruleset "main": PR required, merge queue required, the eight
+  │            checks above required, no force-push, no deletion)
   ├─ ci.yml ············· full-workspace required checks
   └─ docker-cache-refresh per-app GHCR cache repair/refresh
   │
 release-please.yml ····· accumulates merges into per-app release PRs
   │
 tag push (e.g. map@1.2.3) → deploy-<app>.yml → _deploy-cloudrun.yml
-       ├─ ci-gate ······· waits for build/lint/typecheck/format-check/
-       │                  test-coverage on the tagged SHA
+       ├─ ci-gate ······· tag must be on main, then waits for the required
+       │                  CI checks matched by check-regexp on its SHA
        ├─ build ········· container image built once, pushed to Artifact Registry
        ├─ deploy-staging  Cloud Run (staging project) [+ cache revalidate]
        └─ deploy-prod ··· needs staging success; Cloud Run (prod project)
@@ -43,8 +47,10 @@ tag push (e.g. map@1.2.3) → deploy-<app>.yml → _deploy-cloudrun.yml
 
 ## Gate-by-gate
 
-The required checks run on `pull_request` (any target branch) and on `push` to
-`main`. Every job checks out with `persist-credentials: false`; Node-based jobs
+The required checks run on `pull_request` (any target branch), on `merge_group`
+(each merge-queue entry) and on `push` to `main`. Every required check needs a
+`merge_group` trigger: a check that never reports on a queue entry holds the
+queue until the check times out. Every job checks out with `persist-credentials: false`; Node-based jobs
 use the shared `.github/actions/setup` for pnpm and Node from `.nvmrc`. The five
 Turbo-backed jobs enable that action's GitHub Actions-backed remote cache;
 unrelated setup callers do not start the cache server. Third-party actions are
@@ -57,8 +63,8 @@ The five Turbo-backed required checks (`format-check`, `lint`, `typecheck`,
 changed workspaces and their dependents. Their checkouts include the complete
 Git history needed for the comparison. Setup pins Turbo's affected calculation
 to the pull request's exact base and head SHAs, while the tasks themselves run
-against GitHub's checked-out synthetic merge commit. Pushes to `main` omit the
-flag and validate the full workspace from a shallow checkout. Setup also runs
+against GitHub's checked-out synthetic merge commit. Merge-queue runs and pushes
+to `main` omit the flag and validate the full workspace from a shallow checkout. Setup also runs
 the full workspace when the pull request's base/head SHAs are unavailable,
 Turbo selects no runnable task for the specific gate, receives no task name,
 or fails to calculate or parse the affected set — `scripts/select-turbo-scope.sh`
@@ -71,6 +77,12 @@ safeguards in the `lint` job (`lint:ws`, coverage-threshold validation, Python
 task validation, Turbo scope-selection validation, and `lint:unused`) remain
 repository-wide on every run.
 
+The `pnpm lint` step in [`ci.yml`](../.github/workflows/ci.yml) passes Turbo a
+`--concurrency` limit to reduce peak memory from simultaneous type-aware ESLint
+processes on cold runs. This limits scheduling, not workspace selection: all
+selected tasks still run. Local `pnpm lint` keeps Turbo's default concurrency;
+pass the same `--concurrency` value as that step to match CI.
+
 The Turbo cache adapter runs on localhost within each job and stores task
 artifacts in GitHub Actions cache. Relative cache paths make cache versions
 portable across runners whose temporary checkout paths differ. Docker layers
@@ -79,16 +91,11 @@ cache budget. The pnpm store remains a smaller co-tenant with Turbo artifacts
 in that budget and is still subject to GitHub's normal least-recently-used
 eviction. Cache adapter startup is non-blocking: if it fails, Turbo runs without
 remote caching rather than failing a required check and emits a workflow
-warning. `GITHUB_SHA` remains declared as a pass-through variable because the
-shared `eslint-config-turbo` rule `turbo/no-undeclared-env-vars` validates the
-CI-factory reference. The CI-factory review and triage commands run directly
-outside `turbo run`, so they inherit the runner-provided value normally, while
-excluding the SHA from Turbo's global hash inputs preserves cross-commit cache
-hits for every Turbo task.
+warning.
 
 Remote caching is enabled only for the five required CI checks during this
 rollout. Preview and deploy workflows continue to build without this adapter so
-their behavior is unchanged. A matching successful `test` task may be replayed
+their behavior is unchanged. A matching successful cache-enabled `test` task may be replayed
 instead of re-executed; that is standard Turbo cache behavior, so post-rollout
 validation should confirm useful hit rates and continue treating flaky tests as
 test defects rather than relying on reruns. It should also inspect Actions cache
@@ -113,38 +120,57 @@ blocklist of its own:
   hashing and affected selection. `.nvmrc` is included because every affected
   job takes its Node version from it. The CI workflow is included because
   Slackbot's Docker contract tests read it; workflow edits must select those
-  tests and invalidate their cached results.
+  tests.
   The app Dockerfiles cover the same tests' cross-app file-existence checks.
-  These conservative inputs invalidate every task's cache when they change.
+  These conservative inputs invalidate cache-enabled tasks when they change.
   Deleted app Dockerfiles additionally force full-workspace test selection:
   Turbo's package-level affected plan can otherwise omit the cross-app tests
   even though their cache key changes.
 
+Python tasks routed through [`scripts/python-task.sh`](../scripts/python-task.sh)
+disable result caching in their per-package `turbo.json`, extending the root
+configuration so shared task settings remain inherited. New wrapper tasks need
+`cache: false` in their package configuration. A successful local missing-tool
+skip must not hide checks after `uv` becomes available. These tasks
+execute whenever selected, including in CI, while unrelated tasks retain caching.
+
 This deliberately changes the PR guarantee: a green PR proves the workspaces
 selected by Turbo's declared dependency graph, not every workspace in the
-repository. Undeclared cross-workspace coupling can therefore surface in the
-full `main` run after merge; a red full run blocks deploys until corrected. The
+repository. The merge queue's full-workspace run tests the PR combined with
+`main` and every PR queued ahead of it, so a break between combined changes
+ejects the PR instead of reaching `main`. It does not catch undeclared
+cross-workspace coupling: a task whose declared inputs are unchanged replays its
+cached result, in the queue and on `main` alike, so a missing dependency edge
+surfaces only on a cache miss. Declare the edge (a workspace dependency or the
+task's `inputs`) so Turbo re-runs the dependent. A red full run on `main` still
+blocks deploys until corrected. The
 zero-selection and detection-failure fallbacks above protect against an empty
 or unavailable affected set, but they cannot infer dependencies missing from
 the graph or detect a plausible nonempty selection that differs from the
 checked-out merge tree.
 
-| #   | Gate                   | What it runs                                                                                                                                               | What it catches                                                                                               | Merge-blocking (`main` ruleset) |
-| --- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------- |
-| 1   | `format-check`         | `pnpm format` (affected workspaces and dependents on PRs; full workspace on `main`)                                                                        | Prettier drift                                                                                                | ✅                              |
-| 2   | `lint`                 | `pnpm lint` (affected workspaces and dependents plus repository-wide safeguards on PRs; full workspace on `main`)                                          | ESLint violations (incl. security rules)                                                                      | ✅                              |
-| 3   | `typecheck`            | `pnpm typecheck` (affected workspaces and dependents on PRs; full workspace on `main`)                                                                     | Type errors in changed workspaces and their consumers                                                         | ✅                              |
-| 4   | `build`                | `pnpm build` (affected workspaces and dependents on PRs; full workspace on `main`)                                                                         | Build breakage in changed workspaces and their consumers                                                      | ✅                              |
-| 5   | `test-coverage`        | `pnpm test` for affected workspaces and dependents on PRs or the full workspace on `main`, plus the full API characterization suite, against `postgres:18` | Unit/integration regressions and API parity drift                                                             | ✅                              |
-| 6   | `security-audit`       | `pnpm audit --prod --audit-level=high`                                                                                                                     | Known high/critical vulns in prod deps                                                                        | ✅                              |
-| 7   | `db-schema-sync`       | Regenerates Drizzle migrations from the schema and diffs them against committed output                                                                     | Schema/migration drift                                                                                        | ✅                              |
-| 8   | `docker-build`         | Docker image builds (admin, analytics, api, auth, map, me, slackbot, slackbot-scripts; matrix, `linux/amd64`, no image push, per-image GHCR layer cache)   | Dockerfile-specific breakage, including the Slackbot scripts image's Python, system and Chromium dependencies | ❌ advisory                     |
-| 9   | `docker-cache-refresh` | Per-app Docker validation plus GHCR layer-cache export (`main` pushes only)                                                                                | Refreshes the read-only cache consumed by PR builds                                                           | ❌ advisory                     |
-| 10  | `recent-package-watch` | npm publish-time report for all workspace deps (same-repo PRs only)                                                                                        | Supply-chain freshness signal — flags deps published in the last 3 days; upserts a PR comment                 | ❌ advisory                     |
-| —   | `pr-title.yml`         | PR title lint (`lint-title`)                                                                                                                               | Non-Conventional-Commit squash titles                                                                         | ✅ (separate workflow)          |
+| #   | Gate                   | What it runs                                                                                                                                                                                                                                           | What it catches                                                                                               | Merge-blocking (`main` ruleset) |
+| --- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------- | ------------------------------- |
+| 1   | `format-check`         | `pnpm format` (affected workspaces and dependents on PRs; full workspace in the merge queue and on `main`)                                                                                                                                             | Prettier drift                                                                                                | ✅                              |
+| 2   | `lint`                 | `pnpm lint` (affected workspaces and dependents plus repository-wide safeguards on PRs; full workspace in the merge queue and on `main`)                                                                                                               | ESLint violations (incl. security rules)                                                                      | ✅                              |
+| 3   | `typecheck`            | `pnpm typecheck` (affected workspaces and dependents on PRs; full workspace in the merge queue and on `main`)                                                                                                                                          | Type errors in changed workspaces and their consumers                                                         | ✅                              |
+| 4   | `build`                | `pnpm build` (affected workspaces and dependents on PRs; full workspace in the merge queue and on `main`)                                                                                                                                              | Build breakage in changed workspaces and their consumers                                                      | ✅                              |
+| 5   | `test-coverage`        | `pnpm test` for affected workspaces and dependents on PRs or the full workspace in the merge queue and on `main`, plus the full API characterization suite and disposable PostgreSQL Slack identity migration/concurrency tests, against `postgres:18` | Unit/integration regressions and API parity drift                                                             | ✅                              |
+| 6   | `security-audit`       | `pnpm audit --prod --audit-level=high`                                                                                                                                                                                                                 | Known high/critical vulns in prod deps                                                                        | ✅                              |
+| 7   | `db-schema-sync`       | Regenerates Drizzle migrations from the schema and diffs them against committed output                                                                                                                                                                 | Schema/migration drift                                                                                        | ✅                              |
+| 8   | `docker-build`         | Docker image builds (every app Dockerfile plus the Slackbot scripts and staging-refresh job images; matrix, `linux/amd64`, no image push, per-image GHCR layer cache)                                                                                  | Dockerfile-specific breakage, including the Slackbot scripts image's Python, system and Chromium dependencies | ❌ advisory                     |
+| 9   | `docker-cache-refresh` | Per-app Docker validation plus GHCR layer-cache export (`main` pushes only)                                                                                                                                                                            | Refreshes the read-only cache consumed by PR builds                                                           | ❌ advisory                     |
+| 10  | `recent-package-watch` | npm publish-time report for all workspace deps (same-repo PRs only)                                                                                                                                                                                    | Supply-chain freshness signal — flags deps published in the last 3 days; upserts a PR comment                 | ❌ advisory                     |
+| —   | `pr-title.yml`         | PR title lint (`lint-title`)                                                                                                                                                                                                                           | Non-Conventional-Commit squash titles                                                                         | ✅ (separate workflow)          |
 
 Local equivalents before pushing: `pnpm format`, `pnpm lint`, `pnpm typecheck`,
 `pnpm build`, `pnpm test` (see [`AGENTS.md`](../AGENTS.md#build-test-and-development-commands)).
+
+The `test-coverage` job always runs the Slackbot identity PostgreSQL suite with
+`SLACKBOT_POSTGRES_TESTS=1`, independently of affected-workspace selection. Its
+`SLACKBOT_POSTGRES_IMAGE` override selects the same pinned GHCR mirror already
+pulled for the job service. Each fixture creates and removes its own container
+and database; it does not mutate the job service database.
 
 ## Deploy pipeline (per app)
 
@@ -153,15 +179,37 @@ per-app release PRs; merging one pushes a tag like `map@1.2.3`, which triggers
 that app's thin `deploy-<app>.yml` caller into the shared
 [`_deploy-cloudrun.yml`](../.github/workflows/_deploy-cloudrun.yml):
 
-1. **`ci-gate`** — waits (does not re-run) for
-   `build|lint|typecheck|format-check|test-coverage` to succeed on the tagged
-   SHA.
+1. **`ci-gate`** — fails unless the tag points at a commit on `main`, then
+   waits (does not re-run) for the CI checks matched by its `check-regexp` to
+   succeed on the tagged SHA. That is every required check
+   except `lint-title`, which runs only on pull requests and so never reports
+   on a tagged commit. The gate fails if a matching check concludes anything
+   other than `success` (including `failure` or `skipped`), or if no check
+   matches at all. A required check that is missing on its own does not fail
+   it, so redeploying a tag cut before a required check was added passes on
+   the checks that ran at that commit. The same `check-regexp` appears in
+   [`_deploy-cloudrun.yml`](../.github/workflows/_deploy-cloudrun.yml),
+   [`_deploy-cloudrun-job.yml`](../.github/workflows/_deploy-cloudrun-job.yml)
+   and [`deploy-homepage.yml`](../.github/workflows/deploy-homepage.yml), and
+   is maintained separately from the `main` ruleset; see
+   [GitHub Actions Conventions](../AGENTS.md#github-actions-conventions) for
+   keeping them in step.
 2. **`build`** — the deploy image is built once and pushed to Artifact
    Registry.
 3. **`deploy-staging`** — Cloud Run in the staging project; optional
    post-deploy cache revalidation.
 4. **`deploy-prod`** — requires staging success, then Cloud Run in the prod
    project.
+
+Deploy gates match emitted check-run names across workflows on the tagged
+commit. Keep those names distinct from the CI checks matched by `check-regexp`,
+so a skipped deploy check cannot replace a successful CI result and block the
+gate. Reusable-workflow jobs include the caller in their check names, such as
+`deploy / build`, so their `build` job IDs do not collide with CI's `build`.
+
+The [Homepage workflow](../.github/workflows/deploy-homepage.yml) publishes to
+GitHub Pages through `ci-check` → `build-homepage` → `deploy`. Its top-level
+build check is named `build-homepage` to stay distinct from CI's `build`.
 
 ## Observations
 
@@ -175,7 +223,8 @@ that app's thin `deploy-<app>.yml` caller into the shared
   Slackbot service image: `f3-nation-ci-cache-slackbot-scripts` is refreshed by
   the existing `main`-only cache job, while PRs only import it. The cache-refresh
   matrix retains its six existing service images plus this scripts image;
-  analytics is validated in PRs but has no cache-refresh entry.
+  analytics and staging-refresh are validated in PRs but have no cache-refresh
+  entry.
 - PR builds receive only `packages: read`: they may import each app's shared
   GHCR cache but cannot update it. Only the `docker-cache-refresh` job on pushes
   to `main` receives `packages: write` and exports new layers. If login or cache
@@ -195,13 +244,25 @@ that app's thin `deploy-<app>.yml` caller into the shared
   should configure and periodically review a package retention policy; this
   workflow does not delete registry data because retention duration and
   recovery requirements are human-owned operational decisions.
-- The active `main` ruleset permits squash merges only and requires strict
-  status checks. The squash creates a new commit SHA whose push-to-`main` CI run
-  performs full-workspace validation, so deploy gates on that full run rather
-  than a PR-scoped `--affected` run.
-- The deploy `ci-gate` regexp waits on the five build/test checks but not
-  `security-audit` (the audit already gated the merge; a tag cut from an
-  unmerged or old SHA relies on that earlier gate).
+- The active `main` ruleset permits squash merges only and requires the merge
+  queue, with "require branches to be up to date" off: the queue tests each PR
+  against current `main` instead. The squash creates a new commit SHA whose
+  push-to-`main` CI run performs full-workspace validation, so deploy gates on
+  that full run rather than a PR-scoped `--affected` run.
+- Queue entries run `ci.yml` but not `docker-build`, which is PR-only, so an
+  image breakage that appears only once two PRs combine is not caught before
+  merge. The push-to-`main` `docker-cache-refresh` job (advisory) surfaces it
+  for every image except `analytics` and `staging-refresh`, which first fail
+  in the deploy `build` job.
+- Merge-queue runs execute the PR's code in this repository, including code
+  from forks, after a codeowner approves it and someone with write access
+  queues it. `ci.yml` reads no
+  repository secrets, and every job that runs on `merge_group` gets a
+  `GITHUB_TOKEN` limited to `contents: read` and at most `packages: read`; the
+  jobs with write grants (`recent-package-watch`, `docker-cache-refresh`) are
+  gated to `pull_request` and `push`, so a queued fork PR can only read. Giving
+  a merge-queue job a secret or a write grant gives it to every queued PR's
+  code as well.
 - The two reserved rungs below are the planned homes for end-to-end
   verification, which today has no rung at all.
 

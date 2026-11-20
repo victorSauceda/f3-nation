@@ -28,6 +28,7 @@ import { db } from "@acme/db/client";
 
 const PRIMARY = "https://auth2.example.test";
 const AUTH3 = "https://auth3.example.test";
+const FIRST_PARTY = "f3-me-test";
 const jwksUrl = (issuer: string) => `${issuer}/.well-known/jwks.json`;
 
 const mocks = vi.hoisted(() => ({
@@ -69,14 +70,24 @@ vi.mock("@acme/auth", () => ({
   getSessionFromHeaders: vi.fn(() => Promise.resolve(null)),
 }));
 
-async function loadClient(env: { authUrl?: string; list?: string }) {
+async function loadClient(env: {
+  authUrl?: string;
+  list?: string;
+  clients?: string;
+}) {
   vi.stubEnv("NEXT_PUBLIC_AUTH_URL", env.authUrl);
   vi.stubEnv("AUTH_TRUSTED_ISSUERS", env.list);
+  vi.stubEnv(
+    "AUTH_TRUSTED_CLIENT_IDS",
+    "clients" in env ? env.clients : FIRST_PARTY,
+  );
   vi.resetModules();
   const { protectedProcedure } = await import("./shared");
+  const { auditContext } = await import("@acme/db");
   const router = {
     identity: protectedProcedure.handler(({ context }) => ({
       id: context.session!.id,
+      auditActor: auditContext.getStore()?.userId,
     })),
   };
   return (token: string) =>
@@ -94,11 +105,17 @@ describe("JWT verification across trusted issuers", () => {
   let userId: number;
   let primaryKey: CryptoKey;
   let auth3Key: CryptoKey;
-  const sign = (issuer: string, privateKey: CryptoKey, tokenUse = "access") =>
-    new SignJWT({ token_use: tokenUse })
+  const sign = (
+    issuer: string,
+    privateKey: CryptoKey,
+    tokenUse = "access",
+    subject = userId,
+    clientId: unknown = FIRST_PARTY,
+  ) =>
+    new SignJWT({ token_use: tokenUse, client_id: clientId })
       .setProtectedHeader({ alg: "RS256" })
       .setIssuer(issuer)
-      .setSubject(String(userId))
+      .setSubject(String(subject))
       .setIssuedAt()
       .setExpirationTime("1h")
       .sign(privateKey);
@@ -168,6 +185,7 @@ describe("JWT verification across trusted issuers", () => {
 
       await expect(call(await sign(PRIMARY, primaryKey))).resolves.toEqual({
         id: userId,
+        auditActor: userId,
       });
 
       mocks.fetched.length = 0;
@@ -197,6 +215,7 @@ describe("JWT verification across trusted issuers", () => {
     it("accepts the first issuer's token, checked against its keys", async () => {
       await expect(call(await sign(PRIMARY, primaryKey))).resolves.toEqual({
         id: userId,
+        auditActor: userId,
       });
       expect(mocks.fetched).toEqual([jwksUrl(PRIMARY)]);
     });
@@ -204,8 +223,18 @@ describe("JWT verification across trusted issuers", () => {
     it("accepts the second issuer's token, checked against its keys", async () => {
       await expect(call(await sign(AUTH3, auth3Key))).resolves.toEqual({
         id: userId,
+        auditActor: userId,
       });
       expect(mocks.fetched).toEqual([jwksUrl(AUTH3)]);
+    });
+
+    it("attributes verified bearer user 1 without legacy-cookie ambiguity", async () => {
+      await expect(
+        call(await sign(PRIMARY, primaryKey, "access", 1)),
+      ).resolves.toEqual({
+        id: 1,
+        auditActor: 1,
+      });
     });
 
     it("rejects an issuer that isn't allowlisted without fetching any keys", async () => {
@@ -280,6 +309,7 @@ describe("JWT verification across trusted issuers", () => {
       );
       await expect(call(await sign(PRIMARY, primaryKey))).resolves.toEqual({
         id: userId,
+        auditActor: userId,
       });
     });
 
@@ -310,6 +340,86 @@ describe("JWT verification across trusted issuers", () => {
       await expect(call(noExp)).rejects.toMatchObject({
         code: "UNAUTHORIZED",
       });
+    });
+  });
+
+  describe("OAuth client allowlist (AUTH_TRUSTED_CLIENT_IDS)", () => {
+    it("accepts each listed client and rejects any other client's token", async () => {
+      const { logWarn } = await import("./logger");
+      const call = await loadClient({
+        list: PRIMARY,
+        clients: `${FIRST_PARTY}, f3-admin-test`,
+      });
+      for (const clientId of [FIRST_PARTY, "f3-admin-test"]) {
+        await expect(
+          call(await sign(PRIMARY, primaryKey, "access", userId, clientId)),
+        ).resolves.toEqual({ id: userId, auditActor: userId });
+      }
+
+      vi.mocked(logWarn).mockClear();
+      for (const clientId of ["third-party-app", `${FIRST_PARTY}-x`, ""]) {
+        await expect(
+          call(await sign(PRIMARY, primaryKey, "access", userId, clientId)),
+        ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+      }
+      expect(logWarn).toHaveBeenCalledWith("api.auth.client_not_trusted", {
+        clientId: "third-party-app",
+      });
+    });
+
+    it("rejects a token with no client_id or a non-string one", async () => {
+      const { logWarn } = await import("./logger");
+      const call = await loadClient({ list: PRIMARY });
+      vi.mocked(logWarn).mockClear();
+      const noClientId = await new SignJWT({ token_use: "access" })
+        .setProtectedHeader({ alg: "RS256" })
+        .setIssuer(PRIMARY)
+        .setSubject(String(userId))
+        .setExpirationTime("1h")
+        .sign(primaryKey);
+      const tokens = [
+        noClientId,
+        await sign(PRIMARY, primaryKey, "access", userId, 123),
+        await sign(PRIMARY, primaryKey, "access", userId, [FIRST_PARTY]),
+      ];
+      for (const token of tokens) {
+        await expect(call(token)).rejects.toMatchObject({
+          code: "UNAUTHORIZED",
+        });
+      }
+      const clientWarnings = vi
+        .mocked(logWarn)
+        .mock.calls.filter(
+          ([event]) => event === "api.auth.client_not_trusted",
+        );
+      expect(clientWarnings).toEqual([
+        ["api.auth.client_not_trusted", { clientId: null }],
+        ["api.auth.client_not_trusted", { clientId: null }],
+        ["api.auth.client_not_trusted", { clientId: null }],
+      ]);
+    });
+
+    it("accepts no JWT when unset, and warns at startup", async () => {
+      const { logWarn } = await import("./logger");
+      vi.mocked(logWarn).mockClear();
+      const call = await loadClient({ list: PRIMARY, clients: undefined });
+      expect(logWarn).toHaveBeenCalledWith(
+        "api.auth.no_trusted_client_ids",
+        expect.anything(),
+      );
+      await expect(call(await sign(PRIMARY, primaryKey))).rejects.toMatchObject(
+        { code: "UNAUTHORIZED" },
+      );
+    });
+
+    it("does not warn about client ids when no issuer is trusted", async () => {
+      const { logWarn } = await import("./logger");
+      vi.mocked(logWarn).mockClear();
+      await loadClient({ clients: undefined });
+      expect(logWarn).not.toHaveBeenCalledWith(
+        "api.auth.no_trusted_client_ids",
+        expect.anything(),
+      );
     });
   });
 

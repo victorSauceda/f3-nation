@@ -8,6 +8,7 @@ from f3_data_models.utils import DbManager
 from slack_sdk.web import WebClient
 
 from features import connect
+from utilities.builders import send_error_response
 from utilities.database.orm import SlackSettings
 from utilities.database.special_queries import get_admin_users
 from utilities.helper_functions import get_user, safe_get, upload_files_to_storage
@@ -55,7 +56,8 @@ def build_region_form(
         if org_record.logo_url:
             try:
                 if requests.head(org_record.logo_url).status_code == 200:
-                    form.blocks.insert(2, orm.ImageBlock(image_url=org_record.logo_url, alt_text="Region Logo"))
+                    logo_block = orm.image_or_link_block(image_url=org_record.logo_url, alt_text="Region Logo")
+                    form.blocks.insert(2, logo_block)
             except requests.RequestException as e:
                 logger.error(f"Error fetching region logo: {e}")
 
@@ -71,6 +73,10 @@ def build_region_form(
 def handle_region_edit(body: dict, client: WebClient, logger: Logger, context: dict, region_record: SlackSettings):
     form_data = REGION_FORM.get_selected_values(body)
 
+    admin_users_slack = safe_get(form_data, actions.REGION_ADMINS)
+    admin_users: list[SlackUser] = [get_user(user_id, region_record, client, logger) for user_id in admin_users_slack]
+    admin_user_ids = [u.user_id for u in admin_users]
+
     file = safe_get(form_data, actions.REGION_LOGO, 0)
     if file:
         file_list, file_send_list, file_ids, low_rez_file_ids = upload_files_to_storage(
@@ -83,7 +89,7 @@ def handle_region_edit(body: dict, client: WebClient, logger: Logger, context: d
             file_name=str(region_record.org_id),
             enforce_png=True,
         )
-        logo_url = file_list[0]
+        logo_url = file_list[0] if file_list else None
     else:
         logo_url = None
 
@@ -124,9 +130,6 @@ def handle_region_edit(body: dict, client: WebClient, logger: Logger, context: d
 
     DbManager.update_record(Org, region_record.org_id, fields)
 
-    admin_users_slack = safe_get(form_data, actions.REGION_ADMINS)
-    admin_users: list[SlackUser] = [get_user(user_id, region_record, client, logger) for user_id in admin_users_slack]
-    admin_user_ids = [u.user_id for u in admin_users]
     admin_role_id = DbManager.find_first_record(Role, filters=[Role.name == "admin"]).id
     admin_records = [
         Role_x_User_x_Org(
@@ -150,6 +153,11 @@ def handle_region_edit(body: dict, client: WebClient, logger: Logger, context: d
         ],
     )
     DbManager.create_or_ignore(Role_x_User_x_Org, admin_records)
+
+    if file and not logo_url:
+        send_error_response(
+            body, client, "The region settings were saved, but the logo couldn't be uploaded. Please try again."
+        )
 
 
 REGION_FORM = orm.BlockView(

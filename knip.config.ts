@@ -16,12 +16,7 @@ const config: KnipConfig = {
     ".claude/scripts/sync-agent-skills.mjs",
     ".github/scripts/code-scanning-issue.cjs",
     ".github/scripts/ready-for-human-review-label.cjs",
-    // AI-SDLC factory tooling (fork-only). Its entry points are CI workflows
-    // (e2e-triage / adversarial-review) invoking `tsx src/review-pr.ts` /
-    // `triage-e2e-failure.ts`, so knip can't trace usage across the workflow
-    // boundary and reports internal helpers as unused. It carries its own
-    // vitest suite; follow-up to configure knip entries properly.
-    "tooling/ci-factory/**",
+    ".github/scripts/pr-author-nudge.cjs",
   ],
   ignoreBinaries: [
     "uv",
@@ -53,6 +48,7 @@ const config: KnipConfig = {
       entry: [
         "scripts/check-eslint-suppressions.mjs",
         "scripts/check-review-links.mjs",
+        "scripts/check-skill-frontmatter.mjs",
         "scripts/check-security-headers-coverage.mjs",
       ],
     },
@@ -75,6 +71,9 @@ const config: KnipConfig = {
       // vi.mock("@f3nation/sso") in auth-login tests intercepts handleLoginRoute's
       // internal call; no static import exists for knip to trace.
       ignoreDependencies: ["@f3nation/sso", ...tailwindLintDeps],
+      // Nothing imports typed-routes.ts; tsc loads it through the tsconfig
+      // `include` to pull in the generated typedRoutes declarations.
+      entry: ["typed-routes.ts"],
     },
     "apps/homepage": { ignoreDependencies: tailwindLintDeps },
     "apps/map": { ignoreDependencies: tailwindLintDeps },

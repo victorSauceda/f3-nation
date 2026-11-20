@@ -52,13 +52,30 @@ Reusable agent skills (procedural runbooks in the
 Code doesn't read `.agents/`, so a `SessionStart` hook in
 `.claude/settings.json` runs `.claude/scripts/sync-agent-skills.mjs` to copy
 them into `.claude/skills/`, which is generated and gitignored — never commit
-anything under it.
+anything under it. Quote any skill frontmatter value that contains ` #` or
+`: `: YAML drops everything after an unquoted ` #` as a comment, and an
+unquoted `: ` makes YAML reject the whole frontmatter. `pnpm lint` runs
+`scripts/check-skill-frontmatter.mjs` to catch both.
 
-When asked for a **release plan** or a **Staging test plan** for the most
-recently merged release-please PR, follow
-[`.agents/skills/release-plan/SKILL.md`](.agents/skills/release-plan/SKILL.md)
-or
-[`.agents/skills/staging-test-plan/SKILL.md`](.agents/skills/staging-test-plan/SKILL.md)
+To implement a GitHub issue — from the issue number through to a draft pull
+request — follow
+[`.agents/skills/implement-issue/SKILL.md`](.agents/skills/implement-issue/SKILL.md).
+
+A skill listed in [`skills-lock.json`](skills-lock.json) is vendored from an
+upstream repository with the [`skills`](https://github.com/vercel-labs/skills)
+CLI. Never edit its files: put repo-specific guidance in the skill that calls
+it. Where a vendored skill conflicts with this file or `docs/`, the repo's
+rule wins. Where it names a skill or file this repo doesn't have, or a skill
+whose name matches a repo skill that does something else, skip that pointer and work from the repo's own sources: the feature spec, ADRs and the
+surrounding code. `pnpm skills:update` updates every vendored skill; review the diff
+like any other dependency bump. It does not undo a local edit: revert that
+commit instead. Add a newly vendored skill's directory to `.prettierignore`.
+The `vendored-skills` workflow opens an issue when upstream has moved or a
+vendored file was edited.
+
+When asked for a **release plan** or a **Staging test plan** for a merged
+release-please PR, follow
+[`.agents/skills/release/SKILL.md`](.agents/skills/release/SKILL.md)
 — even if your tool does not load skills automatically. Likewise, follow
 [`.agents/skills/db-migration/SKILL.md`](.agents/skills/db-migration/SKILL.md)
 for any change to the database schema or migrations.
@@ -75,9 +92,18 @@ or
 [`.agents/skills/pr-local-test/SKILL.md`](.agents/skills/pr-local-test/SKILL.md).
 Who runs each of them, and when, is set by
 [`docs/PR_REVIEW_PROCESS.md`](docs/PR_REVIEW_PROCESS.md).
-The review uses the [Superpowers](https://github.com/obra/superpowers)
-`requesting-code-review` skill when it is installed (optional; a bundled brief
-covers it otherwise).
+`pr-review-inline`'s reviewer prompts are bundled with it, so every assistant
+runs the same prompts, and its `--dry-run` option reviews your own draft PR
+without posting anything.
+
+To set an issue's Type, Priority, Effort and App, or decide whether it gets
+the `good first issue` label — one issue, or the open backlog — follow
+[`.agents/skills/issue-triage/SKILL.md`](.agents/skills/issue-triage/SKILL.md),
+even if your tool does not load skills automatically.
+
+To post the report of open security advisories and their fix PRs to the
+private #security-managers Slack channel, follow
+[`.agents/skills/security-advisory-report/SKILL.md`](.agents/skills/security-advisory-report/SKILL.md).
 
 To address, respond to, or work through review feedback on a pull request,
 follow
@@ -100,11 +126,12 @@ follow
 - **Second checkout or worktree:** `pnpm local:setup --slot N` (N = 1–9) gives it its own ports, containers, and database so it can run next to the main one. See [Running several checkouts at once](docs/LOCAL_DEV_DOCKER.md#running-several-checkouts-at-once-git-worktrees).
 - **Docker services:** `pnpm docker:up` to start (Postgres, Adminer, GCS emulator, Mailpit), `pnpm docker:down` to stop.
 - Each app, `packages/env`, and `packages/db` has its own `.env` file (copied from `.env.example` by `pnpm local:setup`). Never commit `.env` files.
-- Code quality: always run `pnpm lint:fix` (whole repo only; it takes no arguments) and `pnpm format:fix` (for the whole repo — or filter to a certain app/package) to ensure your code passes all lint and formatting checks. Also run `pnpm typecheck` to validate types.
+- Code quality: always run `pnpm lint:fix` (whole repo only; it takes no arguments) and `pnpm format:fix` (whole repo only; do not append `--filter`) to ensure your code passes all lint and formatting checks. Also run `pnpm typecheck` to validate types.
 - `pnpm lint` does **not** cover dead-code detection: CI's `lint` job runs `pnpm lint` and `pnpm lint:unused` (knip) as two separate steps, so run `pnpm lint:unused` as well before pushing.
 - `pnpm ci:local` chains the whole CI sequence (`format` → `lint` → `lint:unused` → `typecheck` → `build` → `test`) and is the closest local predictor of the CI gate.
 - Database helpers: `pnpm db:pull`, `pnpm db:push`, and `pnpm reset-test-db`.
 - Every other build/dev/test command is a standard Turborepo invocation — see the root `package.json` scripts.
+- Python checks also run through pnpm/Turbo. See [How Python is checked](apps/slackbot/AGENTS.md#how-python-is-checked) for task discovery, local `uv` skips, CI behavior, and CodeQL.
 
 ## Coding Style & Naming Conventions
 
@@ -146,7 +173,7 @@ follow
 - Drive the Node version from `.nvmrc` via `actions/setup-node` (`node-version-file: .nvmrc`) — `.nvmrc` is the single source of truth. Never hardcode `node-version:` in a workflow.
 - **Set the Docker target platform at build time, not in the `Dockerfile`.** Cloud Run only runs `linux/amd64`. The app `Dockerfile` `FROM` lines must **not** pin `--platform` (BuildKit's `FromPlatformFlagConstDisallowed` lint, and it forces emulation on arm64 dev machines). Instead pass the platform at the build invocation: `platforms: linux/amd64` on `docker/build-push-action` (CI) and `--platform=linux/amd64` on `docker build` (deploy). Building a **deployable** image locally on Apple Silicon therefore requires an explicit `docker build --platform=linux/amd64 …`. Do **not** switch to `$BUILDPLATFORM` cross-builds — `sharp`'s native binaries are platform-specific and would break in the amd64 runtime.
 - Share toolchain setup through the composite action [`.github/actions/setup`](.github/actions/setup/action.yml) (pnpm + Node + pnpm-store cache + frozen install) instead of repeating setup steps per job.
-- The `main` branch ruleset's required status checks and `check-regexp` in the deploy workflows (`_deploy-cloudrun.yml`, `_deploy-cloudrun-job.yml`, `deploy-homepage.yml`) are two independently-maintained lists — renaming or adding a required check needs both updated by hand, and they can drift apart if only one is updated. Every required check except `lint-title` belongs in each deploy workflow's `check-regexp` — `lint-title` is deliberately excluded from the deploy gate because it only runs on `pull_request` (`pr-title.yml` has no `push` trigger), so it never produces a check-run on a commit reached via tag push, and waiting on one that will never exist would hang the gate rather than deploy.
+- The `main` branch ruleset's required status checks and `check-regexp` in the deploy workflows (`_deploy-cloudrun.yml`, `_deploy-cloudrun-job.yml`, `deploy-homepage.yml`) are two independently-maintained lists — renaming or adding a required check needs both updated by hand, and they can drift apart if only one is updated. Every required check except `lint-title` belongs in each deploy workflow's `check-regexp` — `lint-title` is deliberately excluded from the deploy gate because it never runs on `push` (`pr-title.yml` triggers only on `pull_request` and `merge_group`), so a commit that reached `main` outside the merge queue has no `lint-title` check-run, and waiting on one that will never exist would hang the gate rather than deploy.
 
 ## Scripts and operator CLIs
 
@@ -232,9 +259,18 @@ These rules cover everything an AI assistant writes to GitHub — issues, pull r
 
 - **Pre-flight:** run `bash scripts/gh-check.sh` before reading through `gh`, and `bash scripts/gh-check.sh --require-write` before writing. It confirms `gh` is signed in and can reach the repository with the access needed; set `GH_REPO=<owner>/<name>` to check a repository other than the current checkout. If it fails, show the user its message and stop.
 - **Signature:** end every issue body, PR body, and comment with `_written by <model_name>_`, exactly once, as its final line. Name the actual model or agent (`Claude Opus 5.5`, `Codex`), not a generic label like `AI`. A footer your tool adds on its own goes above it.
-- **Draft PRs:** open pull requests with `gh pr create --draft`; the author marks them ready for review. The hosted review apps skip drafts and start once a PR is marked ready, so work in progress doesn't use up their review runs. The `ai-review` workflow ignores draft status: it runs when its label is added and on every push while the label is on.
+- **Draft PRs:** open pull requests with `gh pr create --draft`; the author marks them ready for review. The hosted review apps skip drafts and start once a PR is marked ready, so work in progress doesn't use up their review runs.
 - **Never resolve review threads.** Resolving them is the PR author's responsibility, once they have read the replies; see [`docs/PR_REVIEW_PROCESS.md`](docs/PR_REVIEW_PROCESS.md#addressing-feedback).
 - **Reply to every review comment you act on**, in its thread, whether you changed code or decided not to, saying what you did and why.
+
+## Filing Issues
+
+These apply to every issue an agent opens, for any reason. The full rule and its rationale are in [`docs/CONTRIBUTING.md` § Filing issues](docs/CONTRIBUTING.md#filing-issues).
+
+- One objective per issue, as small as is reasonable. A task list holds only requirements for that objective, never a batch of independent findings.
+- An audit or review that finds several problems files one issue per problem; being related doesn't make them an Epic. A parent issue of type **Epic** is only for a large, cohesive effort whose issues together deliver one outcome. To set one up through the REST API: `PATCH .../issues/<n>` with `type` set to `Epic`, and `POST .../issues/<n>/sub_issues` with `sub_issue_id` set to the child's numeric `id` (not its issue number).
+- Before filing, search open and closed issues for a duplicate; then use an issue template and lead with the plain-language impact before the root cause and fix.
+- Right after filing, in the same reply, propose any Type, Priority, Effort and App the issue lacks and whether it should get the `good first issue` label, using the [`issue-triage`](.agents/skills/issue-triage/SKILL.md) skill, and set them once the user approves. This applies even when the user only asked for the issue.
 
 ## Pull Request Guidelines
 
@@ -245,8 +281,8 @@ These rules cover everything an AI assistant writes to GitHub — issues, pull r
   - Never include secrets.
 - Keep PRs small enough to review in one sitting (review bots skip very large PRs), with mechanical sweeps (lint, renames, dependency bumps) separate from behavior changes.
 - Before opening a pull request, run `pnpm ci:local` (at minimum `pnpm lint` and `pnpm format`) and commit any coverage-threshold rewrite.
-- Reply to every review thread with what changed (commit SHA) or why not; out-of-scope findings get a tracking issue linked in the reply. AI agents never resolve threads and sign what they write `_written by <model>_` (see [`.agents/skills/github/SKILL.md`](.agents/skills/github/SKILL.md)).
-- File pre-existing bugs found along the way as separate issues, not PR scope creep: search for duplicates, follow the issue templates, and lead with plain-language impact before the root cause and fix.
+- Reply to every review thread with what changed (commit SHA) or why not; out-of-scope findings get a tracking issue linked in the reply. AI agents never resolve threads and sign what they write `_written by <model>_` (see [Writing to GitHub](#writing-to-github)).
+- File pre-existing bugs found along the way as separate issues (see [Filing Issues](#filing-issues)), not PR scope creep.
 
 ## Security & Environment
 

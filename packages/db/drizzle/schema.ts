@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import {
+  bigint,
   boolean,
   check,
   customType,
@@ -338,6 +339,10 @@ export const slackUsers = pgTable(
       table.userId.asc().nullsLast(),
       table.slackTeamId.asc().nullsLast(),
     ),
+    unique("uq_slack_users_slack_id_team_id").on(
+      table.slackId,
+      table.slackTeamId,
+    ),
     foreignKey({
       columns: [table.userId],
       foreignColumns: [users.id],
@@ -510,6 +515,26 @@ export const users = pgTable(
       name: "users_home_region_id_fkey",
     }),
     unique("users_email_key").on(table.email),
+  ],
+);
+
+export const userStravaCredentials = pgTable(
+  "user_strava_credentials",
+  {
+    userId: integer("user_id")
+      .primaryKey()
+      .references(() => users.id, { onDelete: "cascade" }),
+    athleteId: bigint("athlete_id", { mode: "number" }).notNull(),
+    accessToken: text("access_token").notNull(),
+    refreshToken: text("refresh_token").notNull(),
+    expiresAt: bigint("expires_at", { mode: "number" }).notNull(),
+  },
+  (table) => [
+    unique("user_strava_credentials_athlete_id_key").on(table.athleteId),
+    check(
+      "user_strava_credentials_complete",
+      sql`${table.athleteId} > 0 AND ${table.expiresAt} > 0 AND length(${table.accessToken}) > 0 AND length(${table.refreshToken}) > 0`,
+    ),
   ],
 );
 
@@ -1182,6 +1207,27 @@ export const authVerificationTokens = pgTable(
   ],
 );
 
+// One row per sign-in email the map's auth adapter allowed. Kept apart from
+// auth_verification_tokens, whose rows are deleted on redemption, so
+// redeeming a code can't erase its send from the per-address limit.
+export const authVerificationSends = pgTable(
+  "auth_verification_sends",
+  {
+    id: serial().primaryKey().notNull(),
+    identifier: varchar().notNull(),
+    created: timestamp({ mode: "string" })
+      .default(sql`timezone('utc'::text, now())`)
+      .notNull(),
+  },
+  (table) => [
+    index("idx_auth_verification_sends_identifier_created").using(
+      "btree",
+      table.identifier.asc().nullsLast().op("text_ops"),
+      table.created.asc().nullsLast().op("timestamp_ops"),
+    ),
+  ],
+);
+
 export const apiKeys = pgTable(
   "api_keys",
   {
@@ -1759,7 +1805,7 @@ export const betterAuthOauthClientAssertion = authProviderSchema.table(
 // ─── codex schema ────────────────────────────────────────────────────────────
 // Mirrors the standalone Codex database's `codex` schema, plus a primary key
 // on every table: audit history's `audit.enable_tracking` derives row_id from
-// pg_constraint and refuses a table without one. Migration 0034 bootstraps the
+// pg_constraint and refuses a table without one. migration 0038 bootstraps the
 // schema on a fresh database and only adds missing keys where it already
 // exists, since the tables are owned by the Codex app's role. The camelCase
 // columns on `tags` and the `references` table name are reproduced as-is.

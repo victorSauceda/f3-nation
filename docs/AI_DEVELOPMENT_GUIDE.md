@@ -28,6 +28,22 @@ so each tool resolves to the same content:
 | **Greptile**                 | `AGENTS.md` + per-area files and `REVIEW.md` via `.greptile/files.json` | Conventions + code-review rules     |
 | **Cursor**                   | `.cursor/rules/*.mdc`                                                   | Pointer → `AGENTS.md` + this guide  |
 
+`.coderabbit.yaml` also holds per-path review instructions and pre-merge
+checks, and `.greptile/config.json` holds Greptile's scoped rules. Each names
+the `REVIEW.md` `CC-*` or `KP-*` id it applies and restates the rule briefly,
+because each bot applies that text to every file in scope and treats
+`REVIEW.md` only as background. CodeRabbit's pre-merge custom checks name
+their ids the same way. CodeRabbit's `**/*` path instruction, its "Tests would
+catch a revert" check and Greptile's `instructions` restate the "How to
+review" list. When
+a rule changes in `REVIEW.md`, `git grep` its id and update the copies;
+`pnpm lint` fails if a bot config names an id `REVIEW.md` doesn't define,
+if either config leaves out a `CC-*` check, or if a `docs/specs/` file isn't
+listed in `.greptile/files.json`. Rule scopes use globs by kind of code
+(`**/*.tsx`, `apps/**`) rather than lists of app names, so a new app is
+covered. The `docs/specs/` files are Greptile context, scoped to the code each
+spec covers.
+
 **Rule of thumb:** put durable guidance in `AGENTS.md` (or, for deep topics, in
 `docs/` and link it). Keep the tool-specific pointer files thin so they never
 drift. Per-app specifics live in that app's `AGENTS.md`
@@ -62,17 +78,18 @@ The API (`packages/api`, served via oRPC) defines procedure tiers in
 **most restrictive** tier that fits, and remember what each one actually
 guarantees:
 
-| Procedure                 | Guarantee                                                                                                                                                                                                                                                                                                                                                                               |
-| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `publicProcedure`         | No auth. Rate-limited only, no `ctx.db`. Safe for truly public data that needs no DB access (e.g. `ping`).                                                                                                                                                                                                                                                                              |
-| `publicReadProcedure`     | No auth required; session is resolved if present but never asserted, `ctx.db` is available. Safe for public surfaces (e.g. the map's browse/search) whose response — or, for the rare write on this tier, effect — is fine for an anonymous caller. Audit the payload before adding an endpoint here: no user emails, no data scoped to "mine" without a real session to define "mine". |
-| `protectedProcedure`      | A valid session/credential exists. **Does _not_ check what that user may touch.**                                                                                                                                                                                                                                                                                                       |
-| `personalUserProcedure`   | A user session or Auth access token exists; rejects API-key sessions. Personal handlers must still scope resources to that user.                                                                                                                                                                                                                                                        |
-| `editorProcedure`         | Caller has editor or admin role on **any** org. Resource-scoped auth (`checkHasRoleOnOrg`) is still required for specific resources.                                                                                                                                                                                                                                                    |
-| `adminProcedure`          | Caller has admin role on **any** org. Resource-scoped auth still required.                                                                                                                                                                                                                                                                                                              |
-| `nationAdminProcedure`    | Caller has the nation-level admin role specifically.                                                                                                                                                                                                                                                                                                                                    |
-| `revalidateAuthProcedure` | Accepts either a valid `SUPER_ADMIN_API_KEY` header or a nation admin session. Used for cache revalidation.                                                                                                                                                                                                                                                                             |
-| `apiKeyProcedure`         | Accepts a valid API key (`x-api-key` header), either the super-admin key or a DB-registered key.                                                                                                                                                                                                                                                                                        |
+| Procedure                   | Guarantee                                                                                                                                                                                                                                                                                                                                                                               |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `publicProcedure`           | No auth. Rate-limited only, no `ctx.db`. Safe for truly public data that needs no DB access (e.g. `ping`).                                                                                                                                                                                                                                                                              |
+| `publicReadProcedure`       | No auth required; session is resolved if present but never asserted, `ctx.db` is available. Safe for public surfaces (e.g. the map's browse/search) whose response — or, for the rare write on this tier, effect — is fine for an anonymous caller. Audit the payload before adding an endpoint here: no user emails, no data scoped to "mine" without a real session to define "mine". |
+| `protectedProcedure`        | A valid session/credential exists. **Does _not_ check what that user may touch.**                                                                                                                                                                                                                                                                                                       |
+| `personalUserProcedure`     | A user session or Auth access token exists; rejects API-key sessions. Personal handlers must still scope resources to that user.                                                                                                                                                                                                                                                        |
+| `editorProcedure`           | Caller has editor or admin role on **any** org. Resource-scoped auth (`checkHasRoleOnOrg`) is still required for specific resources.                                                                                                                                                                                                                                                    |
+| `adminProcedure`            | Caller has admin role on **any** org. Resource-scoped auth still required.                                                                                                                                                                                                                                                                                                              |
+| `permissionProcedure(...p)` | For each of `p` (`Permission`s from `@acme/shared/app/permissions`), the caller has some role on **any** org that includes it; different roles and orgs may supply different permissions. The handler must still call `ctx.assertPermissionsOnOrg(orgId)` for the org it acts on, which checks the same list. The API docs list `p` on the endpoint automatically.                      |
+| `nationAdminProcedure`      | Caller has the nation-level admin role specifically.                                                                                                                                                                                                                                                                                                                                    |
+| `revalidateAuthProcedure`   | Accepts either a valid `SUPER_ADMIN_API_KEY` header or a nation admin session. Used for cache revalidation.                                                                                                                                                                                                                                                                             |
+| `apiKeyProcedure`           | Accepts a valid API key (`x-api-key` header), either the super-admin key or a DB-registered key.                                                                                                                                                                                                                                                                                        |
 
 ### The critical pitfall: `protectedProcedure` ≠ authorized
 
@@ -119,6 +136,10 @@ auth path): use `checkHasRolesOnOrgs` (per-check results),
 return the same decisions with one hierarchy query per chunk of up to 10,000
 orgs not already covered by a direct role (no query when direct roles cover
 every check).
+
+An endpoint that checks permissions instead of a role declares them in
+`permissionProcedure(...)` and calls `ctx.assertPermissionsOnOrg(orgId)` with
+the org it acts on, which walks the same hierarchy.
 
 ### Reads expose PII too
 

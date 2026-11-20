@@ -1,6 +1,7 @@
 import copy
 import dataclasses
 import hashlib
+import io
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from logging import Logger
 from typing import Any, Dict, List, Tuple
+from urllib.parse import urlparse
 
 import pytz
 import requests
@@ -26,17 +28,19 @@ from f3_data_models.models import (
 )
 from f3_data_models.utils import DbManager, session_scope
 from slack_bolt.oauth.oauth_settings import OAuthSettings
+from slack_sdk.errors import SlackApiError
 from slack_sdk.oauth.installation_store import FileInstallationStore
 from slack_sdk.oauth.state_store import FileOAuthStateStore
 from slack_sdk.web import SlackResponse, WebClient
 from sqlalchemy import select, text
+from sqlalchemy.dialects.postgresql import insert
 
-from utilities import constants
+from utilities import constants, storage
 from utilities.constants import LOCAL_DEVELOPMENT
 from utilities.database.orm import SlackSettings
 
 REGION_RECORDS: Dict[str, SlackSettings] = {}
-SLACK_USERS: Dict[str, SlackUser] = {}
+SLACK_USERS: Dict[tuple[str, str], SlackUser] = {}
 
 
 def get_location_display_name(location: Location) -> str:
@@ -219,12 +223,14 @@ def get_user_names(
     logger,
     client: WebClient,
     return_urls=False,
+    *,
+    team_id: str,
 ):
     names = []
     urls = []
 
     for user_id in array_of_user_ids:
-        user: SlackUser = safe_get(SLACK_USERS, user_id)
+        user: SlackUser = SLACK_USERS.get((team_id, user_id))
         if user:
             names.append(user.user_name)
             urls.append(user.avatar_url)
@@ -238,42 +244,130 @@ def get_user_names(
         return names
 
 
-def get_user(slack_user_id: str, region_record: SlackSettings, client: WebClient, logger: Logger) -> SlackUser:
+def slack_identity_error_context(team_id: str, error: Exception) -> dict[str, str]:
+    slack_error = None
+    if isinstance(error, SlackApiError):
+        try:
+            response = error.response
+            data = getattr(response, "data", response)
+            slack_error = data.get("error") if isinstance(data, Mapping) else None
+        except Exception:
+            # Diagnostics must not replace the caller's recovery path with another failure.
+            slack_error = "response_inspection_failed"
+    if slack_error not in (
+        "response_inspection_failed",
+        "invalid_auth",
+        "token_revoked",
+        "ratelimited",
+        "missing_scope",
+        "user_not_found",
+        "account_inactive",
+        "not_authed",
+    ):
+        slack_error = "other"
+    error_type = type(error).__name__
+    return {
+        "team_id": team_id if isinstance(team_id, str) and re.fullmatch(r"T[A-Z0-9_]{1,63}", team_id) else "other",
+        "error_type": error_type if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", error_type) else "Exception",
+        "slack_error": slack_error if isinstance(error, SlackApiError) else "none",
+    }
+
+
+def _identity_database_error_context(error: Exception) -> dict[str, str]:
+    context = {"sqlstate": "none", "constraint": "none"}
+    try:
+        original = getattr(error, "orig", None)
+        state = getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)
+        constraint = getattr(getattr(original, "diag", None), "constraint_name", None)
+        if state is not None:
+            context["sqlstate"] = state if isinstance(state, str) and re.fullmatch(r"[A-Z0-9]{5}", state) else "other"
+        if constraint is not None:
+            context["constraint"] = (
+                constraint
+                if constraint
+                in (
+                    "uq_slack_users_slack_id_team_id",
+                    "users_email_key",
+                    "slack_users_user_id_fkey",
+                    "slack_users_pkey",
+                    "users_pkey",
+                )
+                else "other"
+            )
+    except Exception:
+        # Driver diagnostics are best effort and must not defeat cached-user recovery.
+        pass
+    return context
+
+
+class UnlinkedSlackIdentityError(ValueError):
+    """The workspace identity cannot yet supply an F3 account for an interaction."""
+
+    def __init__(self):
+        super().__init__(
+            "An F3 account link could not be verified for a Slack member in this action. "
+            "Check that the app can read the member's email, then try again."
+        )
+
+
+def get_user(
+    slack_user_id: str, region_record: SlackSettings, client: WebClient, logger: Logger, *, require_link: bool = True
+) -> SlackUser:
+    user = _resolve_user(slack_user_id, region_record, client, logger)
+    if require_link and safe_get(user, "user_id") is None:
+        raise UnlinkedSlackIdentityError()
+    return user
+
+
+def _resolve_user(slack_user_id: str, region_record: SlackSettings, client: WebClient, logger: Logger) -> SlackUser:
+    if not slack_user_id:
+        raise ValueError("Slack user ID is required")
+    team_id = safe_get(region_record, "team_id")
+    if not team_id:
+        raise ValueError("Slack team ID is required")
     if not constants.is_production_deployment():
         if not SLACK_USERS:
             update_local_slack_users()
-        cached_user: SlackUser | None = safe_get(SLACK_USERS, slack_user_id)
+        cached_user: SlackUser | None = SLACK_USERS.get((team_id, slack_user_id))
         if cached_user and safe_get(cached_user, "user_id"):
             return cached_user
-        return create_user({"id": slack_user_id}, region_record.org_id, team_id=safe_get(region_record, "team_id"))
+        return create_user({"id": slack_user_id}, region_record.org_id, team_id=team_id)
 
     if not SLACK_USERS:
         update_local_slack_users()
 
-    user: SlackUser | None = safe_get(SLACK_USERS, slack_user_id)
-    # A cached row with no user_id has no F3 user yet; resolve it like a new member so create_user links it.
+    user: SlackUser | None = SLACK_USERS.get((team_id, slack_user_id))
+    # An unlinked cached identity can be linked when a member email becomes available.
     if not user or not safe_get(user, "user_id"):
         try:
             user_info = client.users_info(user=slack_user_id)
             # Slack may send "profile": null, which setdefault would keep.
             profile = user_info["user"]["profile"] = user_info["user"].get("profile") or {}
-            # Slack can leave out a member's email (e.g. Slack Connect); without one, create_user keys him like a
-            # bot and makes a new F3 user instead of matching his existing one.
+            # Carry a cached non-bot member’s email into identity resolution when Slack omits it,
+            # preserving email-based matching.
             if user and not safe_get(user, "is_bot") and safe_get(user, "email") and not safe_get(profile, "email"):
                 profile["email"] = safe_get(user, "email")
-            slack_user_record = create_user(user_info["user"], region_record.org_id)
-        except Exception as exc:
+            slack_user_record = create_user(user_info["user"], region_record.org_id, team_id=team_id)
+        except Exception as error:
             if user:
-                # A Slack or database failure here must not break requests that used to get this cached row.
-                # It is still unlinked, so callers must cope with user_id being None.
-                logging.getLogger(__name__).warning(
-                    "Linking unlinked cached Slack user %s failed; returning it unlinked", slack_user_id, exc_info=exc
+                # Keep cached profiles available to display-only callers when refresh fails.
+                context = {**slack_identity_error_context(team_id, error), **_identity_database_error_context(error)}
+                level = logging.WARNING if isinstance(error, SlackApiError) else logging.ERROR
+                logging.getLogger(__name__).log(
+                    level,
+                    "slack.identity.cached_link_failed team_id=%s error_type=%s "
+                    "slack_error=%s sqlstate=%s constraint=%s",
+                    context["team_id"],
+                    context["error_type"],
+                    context["slack_error"],
+                    context["sqlstate"],
+                    context["constraint"],
+                    extra={"json_fields": {"event": "slack.identity.cached_link_failed", **context}},
                 )
                 return user
             raise
 
-        # Update SLACK_USERS with the new id
-        SLACK_USERS[slack_user_id] = slack_user_record
+        SLACK_USERS[(team_id, slack_user_id)] = slack_user_record
         return slack_user_record
     else:
         return user
@@ -303,122 +397,123 @@ def _parse_view_private_metadata(body: dict) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def get_member_email(value) -> str | None:
+    # Raw Slack-ID placeholders in SlackUser.email are not person-matching evidence.
+    if not isinstance(value, str):
+        return None
+    value = value.strip().lower()
+    local, separator, domain = value.partition("@")
+    return value if local and separator and domain and not any(c.isspace() for c in value) else None
+
+
 def create_user(slack_user_info: dict, home_region_id: int | None = None, team_id: str | None = None) -> SlackUser:
-    if not constants.is_production_deployment():
-        slack_id = safe_get(slack_user_info, "id")
-        if not slack_id:
-            raise ValueError("Slack user ID is required")
+    slack_id = safe_get(slack_user_info, "id")
+    if not slack_id:
+        raise ValueError("Slack user ID is required")
+    resolved_team_id = team_id or safe_get(slack_user_info, "team_id")
+    if not resolved_team_id:
+        raise ValueError("Slack team ID is required")
 
-        # The provisional address contains no Slack-supplied data. Replace it only
-        # after the database has assigned an ID, in the same transaction as linking.
-        provisional_email = f"dev.staging-email-sink+pending-{uuid.uuid4().hex}@f3nation.com"
-        lock_key = int.from_bytes(hashlib.sha256(slack_id.encode("utf-8")).digest()[:8], "big", signed=True)
-        with session_scope() as session:
-            session.execute(text("SELECT pg_advisory_xact_lock(:lock_key)"), {"lock_key": lock_key})
-            slack_user_record = session.scalars(select(SlackUser).where(SlackUser.slack_id == slack_id)).first()
-
-            if slack_user_record and safe_get(slack_user_record, "user_id"):
-                session.expunge(slack_user_record)
-                resolved_slack_user = slack_user_record
-            else:
-                existing_team_id = safe_get(slack_user_record, "slack_team_id")
-                resolved_team_id = (
-                    team_id
-                    or safe_get(slack_user_info, "team_id")
-                    or (existing_team_id if existing_team_id and existing_team_id != "NOT FOUND" else None)
-                    or "NOT FOUND"
-                )
+    pair = json.dumps([resolved_team_id, slack_id], separators=(",", ":"))
+    lock_key = int.from_bytes(hashlib.sha256(pair.encode("utf-8")).digest()[:8], "big", signed=True)
+    with session_scope() as session:
+        session.execute(text("SELECT pg_advisory_xact_lock(:lock_key)"), {"lock_key": lock_key})
+        pair_query = (
+            select(SlackUser)
+            .where(SlackUser.slack_id == slack_id, SlackUser.slack_team_id == resolved_team_id)
+            .order_by(SlackUser.slack_updated.desc().nulls_last(), SlackUser.id.asc())
+        )
+        slack_user_record = session.scalars(pair_query).first()
+        if not slack_user_record or slack_user_record.user_id is None:
+            user_record = None
+            if not constants.is_production_deployment():
+                # The provisional address contains no Slack-supplied data and is
+                # finalized in the same transaction as the identity link.
+                provisional_email = f"dev.staging-email-sink+pending-{uuid.uuid4().hex}@f3nation.com"
                 user_record = User(email=provisional_email, f3_name="F3 pending", home_region_id=home_region_id)
                 session.add(user_record)
                 session.flush()
                 user_record.email = f"dev.staging-email-sink+{user_record.id}@f3nation.com"
                 user_record.f3_name = f"F3 {user_record.id}"
-
-                if slack_user_record:
-                    slack_user_record.user_id = user_record.id
-                    slack_user_record.email = user_record.email
-                    slack_user_record.user_name = f"F3 {user_record.id}"
-                    slack_user_record.avatar_url = None
-                    slack_user_record.slack_team_id = resolved_team_id
-                else:
-                    slack_user_record = SlackUser(
-                        user_id=user_record.id,
-                        slack_id=slack_id,
-                        email=user_record.email,
-                        user_name=f"F3 {user_record.id}",
-                        avatar_url=None,
-                        is_admin=False,
-                        is_owner=False,
-                        is_bot=False,
-                        slack_team_id=resolved_team_id,
+                identity_fields = {
+                    "email": user_record.email,
+                    "user_name": user_record.f3_name,
+                    "avatar_url": None,
+                    "is_admin": False,
+                    "is_owner": False,
+                    "is_bot": False,
+                }
+            else:
+                email = get_member_email(safe_get(slack_user_info, "profile", "email"))
+                if not email and slack_user_record and not slack_user_record.is_bot:
+                    email = get_member_email(slack_user_record.email)
+                user_name = (
+                    safe_get(slack_user_info, "profile", "display_name")
+                    or safe_get(slack_user_info, "profile", "real_name")
+                    or slack_id
+                )
+                # Different workspace pairs can concurrently identify the same F3
+                # user; CIText uniqueness arbitrates before the following select.
+                if email:
+                    session.execute(
+                        insert(User)
+                        .values(email=email, f3_name=user_name, home_region_id=home_region_id)
+                        .on_conflict_do_nothing(index_elements=[User.email])
                     )
-                    session.add(slack_user_record)
-                session.flush()
+                    user_record = session.scalars(select(User).where(User.email == email)).one()
+                identity_fields = {
+                    "email": email or slack_id.lower(),
+                    "user_name": user_name,
+                    "avatar_url": safe_get(slack_user_info, "profile", "image_192"),
+                    "is_admin": safe_get(slack_user_info, "is_admin") or False,
+                    "is_owner": safe_get(slack_user_info, "is_owner") or False,
+                    "is_bot": safe_get(slack_user_info, "is_bot") or False,
+                    "slack_updated": safe_convert(slack_user_info.get("updated"), int),
+                }
+
+            if not slack_user_record:
+                session.execute(
+                    insert(SlackUser)
+                    .values(slack_id=slack_id, slack_team_id=resolved_team_id, **identity_fields)
+                    .on_conflict_do_nothing(index_elements=[SlackUser.slack_id, SlackUser.slack_team_id])
+                )
+                slack_user_record = session.scalars(pair_query).one()
+            if slack_user_record.user_id is None and user_record is not None:
+                slack_user_record.user_id = user_record.id
+                if not constants.is_production_deployment():
+                    for field in ("email", "user_name", "avatar_url"):
+                        setattr(slack_user_record, field, identity_fields[field])
+            session.flush()
+            if user_record is not None:
                 session.expunge(user_record)
-                session.expunge(slack_user_record)
-                resolved_slack_user = slack_user_record
 
-        SLACK_USERS[slack_id] = resolved_slack_user
-        return resolved_slack_user
+        # Detach before commit expires attributes; only a successful commit may
+        # publish the resolved identity to the process-local cache.
+        session.expunge(slack_user_record)
 
-    email = safe_get(slack_user_info, "profile", "email")
-    email = email or safe_get(slack_user_info, "id")  # this means it's a bot
-    email = email.lower()
-    user_name = safe_get(slack_user_info, "profile", "display_name") or safe_get(
-        slack_user_info, "profile", "real_name"
-    )
-    avatar_url = safe_get(slack_user_info, "profile", "image_192")
-    user_record = safe_get(DbManager.find_records(User, filters=[User.email == email]), 0)
-
-    # If not, create a new user record
-    if not user_record:
-        user_record = DbManager.create_record(
-            User(
-                email=email,
-                f3_name=user_name,
-                home_region_id=home_region_id,
-            )
-        )
-
-    slack_user_record = safe_get(
-        DbManager.find_records(SlackUser, filters=[SlackUser.slack_id == slack_user_info.get("id")]), 0
-    )
-    if not slack_user_record:
-        # Create a new slack user record
-        slack_user_record = DbManager.create_record(
-            SlackUser(
-                user_id=safe_get(user_record, "id"),
-                slack_id=slack_user_info.get("id"),
-                email=email,
-                user_name=user_name,
-                avatar_url=avatar_url,
-                is_admin=safe_get(slack_user_info, "is_admin") or False,
-                is_owner=safe_get(slack_user_info, "is_owner") or False,
-                is_bot=safe_get(slack_user_info, "is_bot") or False,
-                slack_updated=safe_convert(slack_user_info.get("updated"), int),
-                slack_team_id=safe_get(slack_user_info, "team_id") or "NOT FOUND",
-            )
-        )
-    elif not safe_get(slack_user_record, "user_id"):
-        DbManager.update_record(SlackUser, slack_user_record.id, {SlackUser.user_id: safe_get(user_record, "id")})
-        slack_user_record.user_id = safe_get(user_record, "id")
-
-    # Update SLACK_USERS with the new id
-    SLACK_USERS[slack_user_info.get("id")] = slack_user_record
+    SLACK_USERS[(resolved_team_id, slack_id)] = slack_user_record
     return slack_user_record
 
 
 def update_local_slack_users(slack_user: SlackUser = None) -> None:
     print("Updating local slack users...")
-    global SLACK_USERS
 
     if slack_user:
-        SLACK_USERS[slack_user.slack_id] = slack_user
+        SLACK_USERS[(slack_user.slack_team_id, slack_user.slack_id)] = slack_user
         return
     slack_users: List[SlackUser] = DbManager.find_records(SlackUser, filters=[True])
-
+    selected = {}
+    for user in sorted(
+        slack_users,
+        key=lambda user: (
+            safe_get(user, "slack_updated") is None,
+            -(safe_get(user, "slack_updated") or 0),
+            safe_get(user, "id") or 0,
+        ),
+    ):
+        selected.setdefault((user.slack_team_id, user.slack_id), user)
     SLACK_USERS.clear()
-    SLACK_USERS.update({slack_user.slack_id: slack_user for slack_user in slack_users})
+    SLACK_USERS.update(selected)
 
 
 def get_region_record(team_id: str, body, context, client, logger) -> SlackSettings:
@@ -500,12 +595,14 @@ def get_region_record(team_id: str, body, context, client, logger) -> SlackSetti
 def populate_users(client: WebClient, team_id: str, org_id: int = None) -> None:
     if not constants.is_production_deployment():
         return
+    if not team_id:
+        raise ValueError("Slack team ID is required")
 
     users = client.users_list().get("members") or []
     active_users = []
     for u in users:
         user_id = safe_get(u, "id")
-        if not user_id:
+        if not user_id or user_id == "USLACKBOT":
             continue
         if is_deactivated_slack_user(u):
             continue
@@ -514,29 +611,30 @@ def populate_users(client: WebClient, team_id: str, org_id: int = None) -> None:
     user_list = [
         User(
             f3_name=u["profile"]["display_name"] or u["profile"]["real_name"],
-            email=u["profile"].get("email") or u["id"],
+            email=get_member_email(u["profile"].get("email")),
             avatar_url=u["profile"].get("image_192"),
             home_region_id=org_id,
         )
         for u in active_users
+        if get_member_email(u["profile"].get("email"))
     ]
     DbManager.create_or_ignore(User, user_list)
 
     users_all: List[User] = DbManager.find_records(User, filters=[True])
-    users_dict = {u.email: u.id for u in users_all}
+    users_dict = {u.email.lower(): u.id for u in users_all}
 
     slack_user_list = [
         SlackUser(
             slack_id=u["id"],
-            user_id=users_dict.get(u["profile"].get("email") or u["id"]),
+            user_id=users_dict.get(get_member_email(u["profile"].get("email"))),
             user_name=u["profile"]["display_name"] or u["profile"]["real_name"],
-            email=u["profile"].get("email") or u["id"],
+            email=get_member_email(u["profile"].get("email")) or u["id"].lower(),
             avatar_url=u["profile"]["image_192"],
-            slack_team_id=team_id or "NOT FOUND",
+            slack_team_id=team_id,
             is_admin=u.get("is_admin") or False,
             is_owner=u.get("is_owner") or False,
             is_bot=u.get("is_bot") or False,
-            slack_updated=safe_convert(safe_get(u, "user", "updated"), int),
+            slack_updated=safe_convert(safe_get(u, "updated"), int),
         )
         for u in active_users
     ]
@@ -604,6 +702,8 @@ def parse_rich_block(
     # parse_users: bool = True,
     # parse_channels: bool = True,
     # region_record: Region = None,
+    *,
+    escape_text: bool = False,
 ) -> str:
     """Extracts the plain text representation from a rich text block.
 
@@ -613,6 +713,9 @@ def parse_rich_block(
         block (Dict[str, Any]): Block to parse
         parse_users (bool, optional): If True, user mentions will be parsed to their name. Defaults to True.
         parse_channels (bool, optional): If True, channel mentions will be parsed to its name. Defaults to True.
+        escape_text (bool, optional): If True, literal text is escaped with ``escape_mrkdwn``, so a typed
+            ``<!channel>`` stays literal when the result is sent as mrkdwn; user and channel elements
+            still become working mentions. Defaults to False.
 
     Returns:
         str: Extracted plain text
@@ -623,7 +726,7 @@ def parse_rich_block(
         if element["type"] == "rich_text_quote":
             msg += '"'
         if text["type"] == "text":
-            msg += text["text"]
+            msg += escape_mrkdwn(text["text"]) if escape_text else text["text"]
         if text["type"] == "emoji":
             msg += f":{text['name']}:"
         if text["type"] == "link":
@@ -681,7 +784,7 @@ def replace_user_channel_ids(
     text = text.replace("{}", "")
 
     slack_user_ids = re.findall(USER_PATTERN, text or "")
-    slack_user_names = get_user_names(slack_user_ids, logger, client, return_urls=False)
+    slack_user_names = get_user_names(slack_user_ids, logger, client, return_urls=False, team_id=region_record.team_id)
     text = re.sub(USER_PATTERN, "{}", text)
     text = text.format(*slack_user_names)
 
@@ -720,7 +823,9 @@ def replace_rich_text_user_channel(
         if element["type"] in ["rich_text_section", "rich_text_preformatted", "rich_text_quote"]:
             for text in element["elements"]:
                 if text["type"] == "user":
-                    user_name = get_user_names([text["user_id"]], logger, client, return_urls=False)[0]
+                    user_name = get_user_names(
+                        [text["user_id"]], logger, client, return_urls=False, team_id=region_record.team_id
+                    )[0]
                     text["text"] = f"@{user_name}"
                     text["type"] = "text"
                     del text["user_id"]
@@ -817,6 +922,27 @@ def remove_keys_from_dict(d, keys_to_remove):
         return d
 
 
+_URL_IN_TEXT = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+
+
+def usable_invite_link(saved: str | None) -> str | None:
+    """The first http(s) URL in a region's saved Slack invite link, minus trailing punctuation.
+
+    Returns None when the text has no URL or the first one has no host. A saved link can be Slack's whole share
+    message ("Join me on Slack -- ... from any device: https://...") rather than a bare URL, and sending that text
+    as a link gives the recipient a broken link.
+    """
+    match = _URL_IN_TEXT.search(saved or "")
+    if not match:
+        return None
+    url = match.group(0).rstrip(".,;:!?)]}")
+    try:
+        netloc = urlparse(url).netloc
+    except ValueError:  # e.g. an unmatched IPv6 bracket ("https://[::1")
+        return None
+    return url if netloc else None
+
+
 def safe_convert(value: str | None, conversion, args: list = None, default=None):
     """
     Safely apply conversion to value.
@@ -846,6 +972,11 @@ def current_date_cst() -> date:
     return datetime.now(pytz.timezone("US/Central")).date()
 
 
+def escape_mrkdwn(text: str) -> str:
+    """Escape the characters Slack treats as control sequences in mrkdwn (`<!channel>`, `<@U…>`, links)."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def upload_files_to_storage(
     files: List[Dict[str, str]],
     client: WebClient,
@@ -856,6 +987,15 @@ def upload_files_to_storage(
     file_name: str = None,
     enforce_png: bool = False,
 ) -> Tuple[List[str], List[Dict[str, Any]], List[str], List[str]]:
+    """Copy Slack-hosted files into storage under ``bucket_name`` (a storage directory).
+
+    Returns the stored files' public URLs, email attachments (``content`` and ``meta``),
+    the Slack file ids, and the public URLs of the low-resolution copies. A file that
+    fails is logged and left out of every list except the Slack file ids, which hold
+    every input file. Copies of it already stored are deleted only when ``file_name``
+    is unset; under a caller-chosen ``file_name`` they stay, because they replace an
+    object a saved URL may point to.
+    """
     file_list = []
     file_send_list = []
     file_ids = [file["id"] for file in files]
@@ -865,14 +1005,15 @@ def upload_files_to_storage(
     bucket_name = bucket_name or "backblast-images"
 
     for file in files or []:
+        stored_names = []
         try:
             r_full = requests.get(file["url_private_download"], headers={"Authorization": f"Bearer {client.token}"})
             r_full.raise_for_status()
 
             file_id = file_name or file["id"]
             current_file_name = f"{file_id}.{file['filetype']}"
-            file_path = f"/mnt/{bucket_name}/{current_file_name}"
             file_mimetype = file["mimetype"]
+            content = r_full.content
 
             # Determine the highest thumbnail size possible
             thumb_sizes = [64, 80, 160, 360, 480, 720, 800, 960, 1024]
@@ -880,36 +1021,35 @@ def upload_files_to_storage(
             available_thumbs = [size for size in thumb_sizes if f"thumb_{size}" in file]
             thumb_size = max(available_thumbs) if available_thumbs else None
 
-            with open(file_path, "wb") as f:
-                f.write(r_full.content)
-
+            low_res_content = None
             if thumb_size is not None:
-                r_low_res = requests.get(
-                    file[f"thumb_{thumb_size}"],
-                    headers={"Authorization": f"Bearer {client.token}"},
-                    params={"width": constants.LOW_REZ_IMAGE_SIZE, "height": constants.LOW_REZ_IMAGE_SIZE},
-                )
-                file_name_low_res = f"{file_id}_low_res.png"
-                file_path_low_res = f"/mnt/{bucket_name}/{file_name_low_res}"
-
-                with open(file_path_low_res, "wb") as f:
-                    f.write(r_low_res.content)
-
-                low_res_file_list.append(
-                    f"https://storage.googleapis.com/{constants.FILE_BUCKET_PREFIX}/{bucket_name}/{file_name_low_res}"
-                )
+                # The thumbnail is optional: a failed download still stores the full-size file.
+                try:
+                    r_low_res = requests.get(
+                        file[f"thumb_{thumb_size}"],
+                        headers={"Authorization": f"Bearer {client.token}"},
+                        params={"width": constants.LOW_REZ_IMAGE_SIZE, "height": constants.LOW_REZ_IMAGE_SIZE},
+                    )
+                except requests.RequestException as e:
+                    logger.error(f"Error downloading thumbnail for file {file['id']}: {e}")
+                else:
+                    if r_low_res.ok:
+                        low_res_content = r_low_res.content
+                    else:
+                        logger.error(f"Error downloading thumbnail for file {file['id']}: HTTP {r_low_res.status_code}")
 
             change_to_png = enforce_png and file["filetype"] != "png"
             if enforce_square or max_height or change_to_png:
                 img = None
                 if file_mimetype.startswith("image/"):
                     try:
-                        img = Image.open(file_path)
+                        img = Image.open(io.BytesIO(content))
                     except Exception as e:
                         logger.error(f"Error opening image: {e}")
 
                 # If we have an image, apply enforce_square and max_height
                 if img is not None:
+                    source_format = img.format
                     # Enforce square if requested
                     if enforce_square:
                         max_side = max(img.width, img.height)
@@ -921,27 +1061,31 @@ def upload_files_to_storage(
                     # Downscale to max_height if provided (after squaring)
                     if max_height is not None and img.height > max_height:
                         img = img.resize((max_height, max_height), Image.LANCZOS)
-                    # Save the possibly modified image
-                    img_format = "PNG" if file["filetype"] == "heic" or change_to_png else img.format
+                    # Re-encode the possibly modified image
+                    img_format = "PNG" if file["filetype"] == "heic" or change_to_png else source_format
                     if img_format == "PNG" and not current_file_name.endswith(".png"):
-                        old_path = file_path
                         current_file_name = f"{file_id}.png"
-                        file_path = f"/mnt/{bucket_name}/{current_file_name}"
                         file_mimetype = "image/png"
-                    else:
-                        old_path = None
-                    img.save(file_path, format=img_format, quality=95, optimize=True)
-                    if old_path and old_path != file_path:
-                        os.remove(old_path)
+                    buffer = io.BytesIO()
+                    img.save(buffer, format=img_format, quality=95, optimize=True)
+                    content = buffer.getvalue()
 
-                # TODO: if LOCAL_DEVELOPMENT, upload to google storage
+            # Nothing is added to the returned lists until every copy is stored, so a
+            # failure never returns a thumbnail without its full-size file.
+            file_url = storage.write_bytes(bucket_name, current_file_name, content, file_mimetype)
+            stored_names.append(current_file_name)
+            low_res_url = None
+            if low_res_content is not None:
+                low_res_name = f"{file_id}_low_res.png"
+                low_res_url = storage.write_bytes(bucket_name, low_res_name, low_res_content, "image/png")
+                stored_names.append(low_res_name)
 
-            file_list.append(
-                f"https://storage.googleapis.com/{constants.FILE_BUCKET_PREFIX}/{bucket_name}/{current_file_name}"
-            )
+            file_list.append(file_url)
+            if low_res_url is not None:
+                low_res_file_list.append(low_res_url)
             file_send_list.append(
                 {
-                    "filepath": file_path,
+                    "content": content,
                     "meta": {
                         "filename": current_file_name,
                         "maintype": file_mimetype.split("/")[0],
@@ -951,6 +1095,15 @@ def upload_files_to_storage(
             )
         except Exception as e:
             logger.error(f"Error uploading file: {e}")
+            # A caller-chosen file_name replaces an object a saved URL may already point
+            # to, so only per-upload names (Slack file IDs) are safe to delete.
+            for name in stored_names if file_name is None else []:
+                try:
+                    storage.delete(bucket_name, name)
+                except FileNotFoundError:
+                    pass
+                except Exception as cleanup_error:
+                    logger.error(f"Error deleting partially uploaded file {name}: {cleanup_error}")
 
     return file_list, file_send_list, file_ids, low_res_file_list
 
@@ -962,47 +1115,6 @@ def highest_resolution_thumb(file: Dict[str, Any]) -> str:
         return None
     thumb_size = max(available_thumbs)
     return file[f"thumb_{thumb_size}"]
-
-
-def reupload_file_as_bot(
-    file: Dict[str, Any],
-    client: WebClient,
-    logger: Logger,
-    region_record: SlackSettings = None,
-    filename: str = None,
-) -> str | None:
-    """Download a user-uploaded Slack file and re-upload it as the bot to the bot log channel.
-
-    Uploading to the public bot log channel ensures the file is accessible workspace-wide,
-    allowing it to be referenced in slack_file image blocks in channel messages.
-
-    Returns the bot-owned file ID, or None on failure.
-    """
-    from utilities.bot_logger import _ensure_bot_in_channel, _find_or_create_log_channel  # noqa: PLC0415
-
-    try:
-        r = requests.get(file["url_private_download"], headers={"Authorization": f"Bearer {client.token}"})
-        r.raise_for_status()
-        fname = filename or f"{file['id']}.{file.get('filetype', 'bin')}"
-
-        # Resolve the bot log channel so the uploaded file is publicly accessible workspace-wide
-        channel_id = region_record.bot_log_channel if region_record else None
-        if not channel_id:
-            channel_id = _find_or_create_log_channel(client, logger)
-            if channel_id:
-                _ensure_bot_in_channel(client, channel_id, logger)
-
-        response = client.files_upload_v2(
-            filename=fname,
-            file=r.content,
-            channel=channel_id,
-        )
-        print(f"Re-uploaded file {file['id']} as bot with new file ID {safe_get(response, 'file', 'id')}")
-        print(f"Response from Slack API: {response}")
-        return safe_get(response, "files", 0, "id")
-    except Exception as e:
-        logger.error(f"Error re-uploading file {safe_get(file, 'id')} as bot: {e}")
-        return None
 
 
 # Helper function to sort by name, ignoring any prefixes we might want to ignore

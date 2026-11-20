@@ -30,12 +30,9 @@ from features.calendar.event_preblast import (
     get_preblast_channel,
     post_hc_thread_reply,
 )
-from utilities import constants
+from utilities import constants, storage
 from utilities.constants import (
-    GCP_IMAGE_URL,
-    LOCAL_DEVELOPMENT,
     MAX_CALENDAR_WEEKS,
-    S3_IMAGE_URL,
     WEEK_LABELS,
     WEEK_SCHEDULE_LABELS,
 )
@@ -104,7 +101,7 @@ def build_home_form(
     if action_id == actions.CALENDAR_HOME_DATE_FILTER and not safe_get(body, "actions", 0, "selected_date"):
         return
     slack_user_id = safe_get(body, "user", "id") or safe_get(body, "user_id")
-    user_id = get_user(slack_user_id, region_record, client, logger).user_id
+    user_id = get_user(slack_user_id, region_record, client, logger, require_link=False).user_id
 
     metadata = safe_convert(safe_get(body, "view", "metadata", "event_payload"), json.loads) or {}
     user_is_admin = safe_get(metadata, "user_is_admin")
@@ -359,10 +356,7 @@ def build_calendar_image_form(
             # No image generated yet - skip the (guaranteed to fail) HEAD request so we stay well
             # inside the few seconds a Slack trigger_id stays valid.
             continue
-        if LOCAL_DEVELOPMENT:
-            image_url = S3_IMAGE_URL.format(image_name=image_name)
-        else:
-            image_url = GCP_IMAGE_URL.format(bucket="f3nation-calendar-images", image_name=image_name)
+        image_url = storage.public_url(storage.CALENDAR_IMAGES, image_name)
         try:
             valid = requests.head(image_url, timeout=2).status_code == 200
         except Exception as e:
@@ -374,7 +368,7 @@ def build_calendar_image_form(
 
     if valid_weeks:
         blocks = [
-            orm.ImageBlock(
+            orm.image_or_link_block(
                 label=WEEK_SCHEDULE_LABELS[week], alt_text=WEEK_SCHEDULE_LABELS[week], image_url=image_urls[week]
             )
             for week in valid_weeks
@@ -605,7 +599,9 @@ def handle_assign_q_form(
 def handle_home_event(body: dict, client: WebClient, logger: Logger, context: dict, region_record: SlackSettings):
     event_instance_id = safe_convert(safe_get(body, "actions", 0, "action_id").split("_")[1], int)
     action = safe_get(body, "actions", 0, "selected_option", "value")
-    user_id = get_user(safe_get(body, "user", "id"), region_record, client, logger).user_id
+    user_id = get_user(
+        safe_get(body, "user", "id"), region_record, client, logger, require_link=action != "View Preblast"
+    ).user_id
     view_id = safe_get(body, "view", "id")
     update_post = False
     hc_action: bool | None = None  # True = HC, False = Un-HC, None = not an HC action

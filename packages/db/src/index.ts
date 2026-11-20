@@ -5,6 +5,7 @@ import {
   attendanceXAttendanceTypes,
   authAccounts,
   authSessions,
+  authVerificationSends,
   authVerificationTokens,
   betterAuthOauthClient,
   betterAuthSession,
@@ -36,6 +37,7 @@ import {
   slackUsers,
   updateRequests,
   users,
+  userStravaCredentials,
 } from "../drizzle/schema";
 
 export const schema = {
@@ -45,6 +47,7 @@ export const schema = {
   apiKeys,
   authAccounts,
   authSessions,
+  authVerificationSends,
   authVerificationTokens,
   events,
   eventInstances,
@@ -68,6 +71,7 @@ export const schema = {
   orgsXSlackSpaces,
   updateRequests,
   users,
+  userStravaCredentials,
 };
 
 /** Auth schema tables (auth.*) — kept separate to avoid name collisions */
@@ -85,3 +89,12 @@ export const authSchema = {
 export * from "drizzle-orm";
 export { getUserRoles } from "./queries/roles";
 export type { UserRoleRow } from "./queries/roles";
+
+export {
+  auditContext,
+  auditSettingsSql,
+  runWithAuditContext,
+  toAuditUserId,
+  withAuditContext,
+} from "./utils/audit-context";
+export type { AuditContext } from "./utils/audit-context";

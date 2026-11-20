@@ -25,12 +25,18 @@ All the apps in this monorepo can be developed and tested locally. See [LOCAL_DE
    - Once the AI bots' review threads are resolved, add the `ready for human review` label if you have `write` access to the repo.
      - Don't have `write` access, or forgot to add it? A scheduled workflow ([`ready-for-human-review-label.yml`](../.github/workflows/ready-for-human-review-label.yml)) applies the label automatically once your PR is out of draft, has no merge conflicts with `main`, all required checks are green, and the AI review bots' threads are resolved — it runs daily, so there can be up to a day's delay. The same workflow also removes the label if any of those stop being true (e.g. a new commit resets checks to pending, or `main` moves ahead and your branch now has merge conflicts), even if you added it by hand. Only actual merge conflicts count: a branch that is merely behind `main`, or unresolved threads from human reviewers, won't remove the label. A maintainer can trigger it manually for a fresher check.
      - Small, self-evident PRs (a one-line fix, a doc correction) are sometimes approved and merged by a codeowner before the label is ever applied. That's fine — the label is a review-queue signal, not a required check.
+1. Once your PR is approved, anyone with write access can add it to the merge queue with **Merge when ready**, which re-runs the checks against the latest `main` and merges it a few minutes later. You don't need to keep your branch up to date with `main`; only fix actual merge conflicts.
+   - If a required check fails in the queue, your PR is taken out of it and the failed run shows in its checks. Fix it, push, and ask someone with write access to queue it again. [Merging](PR_REVIEW_PROCESS.md#merging) explains what the failure usually means.
 
 ## Finding PRs that need you
 
-Run `pnpm pr:triage` to see every open PR sorted by what it needs next: waiting on the AI bots, needs the `pr-review-inline` skill, waiting on the author's unresolved threads, needs the `pr-local-test` skill, needs a codeowner's approval, or approved and waiting to merge. Your own PRs get their own section, since someone else has to approve them. Run `pnpm pr:triage:html` to open the same thing as a board in your browser; run it again to refresh.
+Run `pnpm pr:triage` to see every open PR sorted by what it needs next: needs the `pr-review-inline` skill, waiting on the author's unresolved threads, waiting on a reviewer's reply (the author has answered every open thread), needs the `pr-local-test` skill, needs a codeowner's approval, or approved and waiting to merge. Only a codeowner's skill run moves a PR along in the Codeowners PR Report. A codeowner's run on their own PR is a self-check and doesn't move it. `pnpm pr:triage` also counts runs recorded in your own local ledger, except on your own PRs. Codeowners are read from [`.github/CODEOWNERS`](../.github/CODEOWNERS). Your own PRs get their own section, since someone else has to approve them. Run `pnpm pr:triage:html` to open the same thing as a board in your browser; run it again to refresh. Buttons at the top of the board narrow it to the PRs assigned to you, the ones nobody is assigned to, or "My responsibility": your own PRs, plus the others whose next move can be yours.
+
+Both commands pass `--with-advisories`. If your GitHub login can see any of the repository's open security advisories, the fix PRs in each advisory's temporary private fork are sorted into the same lists, ahead of the repository's own PRs and tagged with the advisory's ID and severity. A separate list, shown before the others, holds the advisories with no fix PR ready for review: no fork, or a fork with no open PRs other than drafts. An advisory whose fork couldn't be read in full is left off that list, and the board notes that some forks couldn't be read. If your login can't see any advisories, or GitHub refuses the advisory list (403 or 404), the output is the same as without the flag. Any other failure to read the advisory list is noted on the board and on stderr. The board file is readable only by you.
 
 It needs the [GitHub CLI](https://cli.github.com) (signed in with `gh auth login`) and `jq`, and works on macOS, Linux and WSL. Drafts and Renovate and release-please PRs are left out. `scripts/pr-triage.sh --help` lists the options.
+
+`scripts/pr-triage.sh --json` prints the board's data as JSON, with security advisories only when `--with-advisories` is passed. The Codeowners PR Report reads it without that flag: a workflow ([`codeowners-pr-report.yml`](../.github/workflows/codeowners-pr-report.yml)) posts the PRs a codeowner can act on to the #monorepo Slack channel each weekday morning, as described in [How to tell it's your turn](PR_REVIEW_PROCESS.md#how-to-tell-its-your-turn). Its Slack mentions come from the `CODEOWNERS_SLACK_IDS` repository variable, a JSON object of GitHub login to Slack member ID; a codeowner missing from it shows as plain text.
 
 ## Use of AI
 
@@ -38,13 +44,21 @@ AI tools are welcome for writing code, tests, and PR descriptions. You're respon
 
 Conventions for writing code live in each area's `AGENTS.md`; rules for reviewing it live in [`REVIEW.md`](../REVIEW.md), which every AI reviewer loads. If a review bot keeps raising the same false positive, add a "do not flag" entry to `REVIEW.md`. If reviewers keep catching the same mistake, add a one-line rule to the matching `AGENTS.md`.
 
+## Filing issues
+
+Each issue covers one objective and is as small as is reasonable, ideally something a single PR can close. Small, single-focus issues are easier to claim, track and review, and they're the kind that suits `good first issue`.
+
+- An issue can have a task list, but every task is a requirement for that one objective. If a task could be done, reviewed and closed on its own, it's a separate issue.
+- Found several problems (an audit, a review, a bug bash)? File one issue per problem, and mention closely related ones in each other's descriptions. Being related isn't a reason for an Epic: the **Epic** type is for a large, cohesive effort whose issues only together deliver one outcome, each added to it as a sub-issue. Setting an issue's type and adding sub-issues needs triage access or higher. Without it, file the Epic and its child issues yourself, then comment on the Epic mentioning a code owner (see [`.github/CODEOWNERS`](../.github/CODEOWNERS)) and ask them to set its type and link the children.
+- Search open and closed issues for a duplicate first, use an issue template, and lead with the plain-language impact before the root cause and fix.
+
 ## Choosing which Issues to work on
 
 Short answer: work on whatever interests you. Any improvement you can make will be appreciated, even if there's not a current Issue for it.
 
 New to the project? Issues labeled [`good first issue`](https://github.com/F3-Nation/f3-nation/issues?q=is%3Aopen+is%3Aissue+label%3A%22good+first+issue%22) are a good place to start; [`help wanted`](https://github.com/F3-Nation/f3-nation/issues?q=is%3Aopen+is%3Aissue+label%3A%22help+wanted%22) issues are ones we'd love a hand with.
 
-Some issues are checklists of small, independent items — each one is meant to be its own PR. Comment on the issue to claim an item before you start, and once your PR merges, comment again with the PR number and what you verified. Contributors can't tick boxes in someone else's issue, so a maintainer will check it off from your comment.
+Larger efforts are tracked as Epics: parent issues whose sub-issues are each their own small piece of work. Pick a sub-issue and comment on it to claim it before you start.
 
 If you're looking to drive along the roadmap with us, check out the Issues project board: https://github.com/orgs/F3-Nation/projects/4
 

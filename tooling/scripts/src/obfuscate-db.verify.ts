@@ -49,12 +49,14 @@ import {
   unreviewedColumns,
 } from "./obfuscate-db.columns";
 import { isLoremRich, isLoremText } from "./obfuscate-db.lorem";
-import { quoteQualified } from "./db-url";
+import { libpqEnv, quoteIdent, quoteQualified } from "./db-url";
+import type { FkEdge } from "./staging-refresh.checks";
 import { fkEdges, planKeptFks } from "./staging-refresh.checks";
 import {
   PRESERVED_TABLES,
   SNAPSHOT_EMAIL_SINK,
   SNAPSHOT_TABLES,
+  SNAPSHOT_WINDOW,
 } from "./staging-refresh.config";
 import {
   dropFksAndTruncate,
@@ -109,6 +111,7 @@ const KEPT_TABLES = [
 ];
 
 const EMPTY_TABLES = [
+  "user_strava_credentials",
   "auth_sessions",
   "auth_verification_tokens",
   "auth_accounts",
@@ -136,6 +139,11 @@ const EMAIL_REGEX = /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/g;
 // The obfuscator's default --email-sink; every rewritten address is a +tag on it.
 const SINK_PREFIX = "dev.staging-email-sink+";
 const SINK_SUFFIX = "@f3nation.com";
+const SYNTHETIC_LOCATION_DESCRIPTION =
+  "Synthetic Runner meets here before sunrise.";
+const SYNTHETIC_REQUEST_LOCATION_DESCRIPTION =
+  "Synthetic Gardener shares directions to this field.";
+const SYNTHETIC_REQUEST_TOKEN = "00000000-0000-4000-8000-000000001061";
 
 function isSinkAddress(email: string): boolean {
   const lower = email.toLowerCase();
@@ -296,6 +304,9 @@ function check(name: string, pass: boolean, detail: string) {
 
 interface PlantedIds {
   userId: number;
+  expansionId: number;
+  achievementId: number;
+  requestId: string;
   privateLocationId: number;
   mixedLocationId: number;
   unusedLocationId: number;
@@ -344,6 +355,27 @@ async function plantSyntheticPii(sql: postgres.Sql): Promise<PlantedIds> {
     RETURNING id`;
   if (!user) throw new Error("Failed to insert synthetic user");
 
+  await sql`UPDATE users SET meta = meta || '{"strava_access_token":"synthetic-access","strava_refresh_token":"synthetic-refresh","strava_future":"synthetic-future"}'::jsonb WHERE id = ${user.id}`;
+  await sql`INSERT INTO user_strava_credentials (user_id, athlete_id, access_token, refresh_token, expires_at) VALUES (${user.id}, 7000001, 'synthetic-access', 'synthetic-refresh', 2000000000)`;
+
+  const [expansion] = await sql<{ id: number }[]>`
+    INSERT INTO expansions (area, pinned_lat, pinned_lon, user_lat, user_lon,
+      interested_in_organizing)
+    VALUES ('Synthetic Expansion Field', 35.61234, -80.93456, 35.67891,
+      -80.96234, true)
+    RETURNING id`;
+  if (!expansion) throw new Error("Failed to insert synthetic expansion");
+  await sql`
+    INSERT INTO expansions_x_users (expansion_id, user_id, notes)
+    VALUES (${expansion.id}, ${user.id},
+      'Call Synthetic Organizer at 704-555-0199')`;
+
+  const [achievement] = await sql<{ id: number }[]>`
+    INSERT INTO achievements (name, description)
+    VALUES ('Synthetic Contact Achievement', 'Award contact: jane@example.com')
+    RETURNING id`;
+  if (!achievement) throw new Error("Failed to insert synthetic achievement");
+
   // This address no longer exists in the source row. Rewriting current users
   // cannot remove it from OLD/NEW snapshots already held by the audit trigger.
   await sql`
@@ -376,14 +408,25 @@ async function plantSyntheticPii(sql: postgres.Sql): Promise<PlantedIds> {
     VALUES (gen_random_uuid()::text, 'jane@example.com', 'deadbeef',
       now() + interval '10 minutes')`;
 
-  await sql`
+  const [request] = await sql<{ id: string }[]>`
     INSERT INTO update_requests (region_id, event_name, request_type,
       submitted_by, event_contact_email, location_contact_email,
-      event_description, meta)
+      event_description, meta, location_description, ao_website, event_meta,
+      token)
     VALUES (${region.id}, 'Test Workout', 'create_event',
       'jane@example.com', 'siteq@hotmail.com', 'ao-contact@yahoo.com',
       'Questions? Ping siteq@hotmail.com',
-      '{"contact": "jane@example.com", "note": "text 704-555-1234"}')`;
+      '{"contact": "jane@example.com", "note": "text 704-555-1234"}',
+      ${SYNTHETIC_REQUEST_LOCATION_DESCRIPTION},
+      'Contact jane@example.com for the AO website',
+      ${sql.json({
+        contact: "jane@example.com",
+        nested: { note: "Email jane@example.com" },
+        count: 2,
+        active: true,
+      })}, ${SYNTHETIC_REQUEST_TOKEN})
+    RETURNING id`;
+  if (!request) throw new Error("Failed to insert synthetic request");
 
   await sql`
     INSERT INTO event_instances (org_id, is_active, highlight, start_date,
@@ -524,6 +567,10 @@ async function plantSyntheticPii(sql: postgres.Sql): Promise<PlantedIds> {
   };
   const privateLocationId = await location("Synthetic Backyard");
   const mixedLocationId = await location("Synthetic Park");
+  await sql`
+    UPDATE locations SET email = 'location-contact@example.com',
+      description = ${SYNTHETIC_LOCATION_DESCRIPTION}
+    WHERE id = ${mixedLocationId}`;
   const unusedLocationId = await location("Synthetic Unused Field");
   const event = async (
     name: string,
@@ -713,6 +760,9 @@ async function plantSyntheticPii(sql: postgres.Sql): Promise<PlantedIds> {
   );
   return {
     userId: user.id,
+    expansionId: expansion.id,
+    achievementId: achievement.id,
+    requestId: request.id,
     privateLocationId,
     mixedLocationId,
     unusedLocationId,
@@ -803,15 +853,35 @@ async function sweepForEmails(
 
 const SNAPSHOT_DB = "f3_snapshot";
 const SNAPSHOT_COPY_DB = "f3_snapshot_copy";
+const SNAPSHOT_LOAD_DB = "f3_snapshot_load";
+const { daysBack: WINDOW_BACK, daysAhead: WINDOW_AHEAD } = SNAPSHOT_WINDOW;
 const dbUrl = (db: string) => {
   const url = new URL(DATABASE_URL);
   url.pathname = `/${db}`;
   return url.toString();
 };
 
+/** Rows of `e.table` whose non-null FK columns match no `e.refTable` row. */
+async function danglingFor(sql: postgres.Sql, e: FkEdge): Promise<number> {
+  const match = e.columns
+    .map((c, i) => `r.${quoteIdent(e.refColumns[i]!)} = t.${quoteIdent(c)}`)
+    .join(" AND ");
+  const set = e.columns
+    .map((c) => `t.${quoteIdent(c)} IS NOT NULL`)
+    .join(" AND ");
+  const [row] = await sql.unsafe<{ n: number }[]>(
+    `SELECT count(*)::int AS n FROM ${quoteQualified(e.table)} t
+     WHERE ${set} AND NOT EXISTS (
+       SELECT 1 FROM ${quoteQualified(e.refTable)} r WHERE ${match})`,
+  );
+  return row?.n ?? 0;
+}
+
 /**
  * A clone of the planted, not yet obfuscated sandbox for the snapshot
- * checks, plus an empty database to stand in for the refresh's copy.
+ * checks, an empty database to stand in for the refresh's copy, and a
+ * second clone to stand in for a developer's seeded database that the
+ * published file is loaded into.
  * CREATE DATABASE … TEMPLATE needs no other session on the template.
  */
 async function cloneForSnapshot(): Promise<void> {
@@ -822,6 +892,9 @@ async function cloneForSnapshot(): Promise<void> {
   try {
     await admin.unsafe(`CREATE DATABASE ${SNAPSHOT_DB} TEMPLATE ${DB_NAME}`);
     await admin.unsafe(`CREATE DATABASE ${SNAPSHOT_COPY_DB}`);
+    await admin.unsafe(
+      `CREATE DATABASE ${SNAPSHOT_LOAD_DB} TEMPLATE ${DB_NAME}`,
+    );
   } finally {
     await admin.end();
   }
@@ -855,9 +928,15 @@ async function verifySnapshotMode(
   const work = mkdtempSync(path.join(os.tmpdir(), "f3-snapshot-verify-"));
   try {
     // Instances on both sides of each edge of the window, with link rows,
-    // blasts and counts.
+    // blasts, counts and an attendance row (with a type and free-text meta).
     const planted = new Map<number, number>();
-    for (const offset of [-31, -30, 90, 91]) {
+    const plantedAttendance = new Map<number, number>();
+    for (const offset of [
+      -WINDOW_BACK - 1,
+      -WINDOW_BACK,
+      WINDOW_AHEAD,
+      WINDOW_AHEAD + 1,
+    ]) {
       const [row] = await snap<{ id: number }[]>`
         INSERT INTO event_instances (org_id, is_active, highlight, start_date,
           name, preblast, backblast, pax_count, fng_count)
@@ -871,6 +950,32 @@ async function verifySnapshotMode(
       await snap`
         INSERT INTO event_instances_x_event_types (event_instance_id, event_type_id)
         SELECT ${row.id}, min(id) FROM event_types`;
+      const [att] = await snap<{ id: number }[]>`
+        INSERT INTO attendance (user_id, event_instance_id, is_planned, meta)
+        SELECT min(id), ${row.id}, false,
+          '{"note": "Jane Smith carpools from 123 Main Street"}'::jsonb
+        FROM users
+        RETURNING id`;
+      if (!att) throw new Error("Harness bug: could not plant attendance");
+      plantedAttendance.set(offset, att.id);
+      await snap`
+        INSERT INTO attendance_x_attendance_types (attendance_id, attendance_type_id)
+        SELECT ${att.id}, min(id) FROM attendance_types`;
+    }
+    // The local seed has no achievements, so plant one to award.
+    const [award] = await snap<{ n: number }[]>`
+      WITH ach AS (
+        INSERT INTO achievements (name) VALUES ('Snapshot probe') RETURNING id),
+      ins AS (
+        INSERT INTO achievements_x_users (achievement_id, user_id, award_year,
+          award_period, meta)
+        SELECT ach.id, (SELECT min(id) FROM users), 1901, 1,
+          '{"citation": "Jane Smith, 123 Main Street"}'::jsonb
+        FROM ach
+        RETURNING 1)
+      SELECT count(*)::int AS n FROM ins`;
+    if (award?.n !== 1) {
+      throw new Error("Harness bug: could not plant an achievement award");
     }
 
     // Inside the window: a private series and one under it, a private
@@ -904,6 +1009,10 @@ async function verifySnapshotMode(
       await snap`
         INSERT INTO event_instances_x_event_types (event_instance_id, event_type_id)
         SELECT ${row.id}, min(id) FROM event_types`;
+      await snap`
+        INSERT INTO attendance (user_id, event_instance_id, is_planned, meta)
+        SELECT min(id), ${row.id}, false, '{"note": "private probe"}'::jsonb
+        FROM users`;
     }
     await snap`
       UPDATE users
@@ -965,7 +1074,7 @@ async function verifySnapshotMode(
       WHERE id = (SELECT min(id) FROM orgs)`;
     await snap`
       UPDATE event_instances SET location_id = ${locs.shared}
-      WHERE id IN (${privateInstances[0]!}, ${planted.get(90)!})`;
+      WHERE id IN (${privateInstances[0]!}, ${planted.get(WINDOW_AHEAD)!})`;
 
     const trim = await trimSnapshot(snap);
     const ids = [...planted.values()];
@@ -982,14 +1091,15 @@ async function verifySnapshotMode(
         AND event_instance_id NOT IN (SELECT id FROM event_instances)`;
     const [outside] = await snap<{ n: number }[]>`
       SELECT count(*)::int AS n FROM event_instances
-      WHERE start_date NOT BETWEEN current_date - 30 AND current_date + 90`;
+      WHERE start_date NOT BETWEEN current_date - ${WINDOW_BACK}::int
+        AND current_date + ${WINDOW_AHEAD}::int`;
     const [blasts] = await snap<{ n: number }[]>`
       SELECT count(*)::int AS n FROM event_instances
       WHERE preblast IS NOT NULL OR backblast IS NOT NULL
         OR preblast_rich IS NOT NULL OR backblast_rich IS NOT NULL`;
-    const keptIds = [planted.get(-30), planted.get(90)];
+    const keptIds = [planted.get(-WINDOW_BACK), planted.get(WINDOW_AHEAD)];
     check(
-      "snapshot trim keeps exactly the -30..+90 day window, with link rows and counts",
+      `snapshot trim keeps exactly the -${WINDOW_BACK}..+${WINDOW_AHEAD} day window, with link rows and counts`,
       survivors.length === 2 &&
         survivors.every(
           (r, i) =>
@@ -1038,6 +1148,36 @@ async function verifySnapshotMode(
       metaLeft?.n === 0,
       `${metaLeft?.n ?? "?"} user(s) still have meta`,
     );
+    const attIds = [...plantedAttendance.values()];
+    const keptAtt = [
+      plantedAttendance.get(-WINDOW_BACK),
+      plantedAttendance.get(WINDOW_AHEAD),
+    ];
+    const attSurvivors = await snap<{ id: number; types: number }[]>`
+      SELECT a.id, (SELECT count(*)::int FROM attendance_x_attendance_types x
+                    WHERE x.attendance_id = a.id) AS types
+      FROM attendance a WHERE a.id IN ${snap(attIds)} ORDER BY a.id`;
+    // The local seed has no attendance, so only the two kept edge rows may
+    // remain: not the outside-window rows, nor those on private instances.
+    const [attTotal] = await snap<{ n: number }[]>`
+      SELECT count(*)::int AS n FROM attendance`;
+    check(
+      "snapshot trim keeps attendance only on kept instances, with its types",
+      attSurvivors.length === 2 &&
+        attSurvivors.every((r, i) => r.id === keptAtt[i] && r.types === 1) &&
+        attTotal?.n === 2,
+      `${attSurvivors.length}/2 edge rows kept, ${attTotal?.n ?? "?"} attendance row(s) left in all (expected 2)`,
+    );
+    const [attMeta] = await snap<{ attendance: number; awards: number }[]>`
+      SELECT
+        (SELECT count(*) FROM attendance WHERE meta IS NOT NULL)::int AS attendance,
+        (SELECT count(*) FROM achievements_x_users
+         WHERE meta IS NOT NULL)::int AS awards`;
+    check(
+      "snapshot trim clears attendance.meta and achievements_x_users.meta",
+      attMeta?.attendance === 0 && attMeta.awards === 0,
+      `${attMeta?.attendance ?? "?"} attendance and ${attMeta?.awards ?? "?"} award row(s) still have meta`,
+    );
     check(
       "snapshot trim nulls every blast",
       blasts?.n === 0,
@@ -1064,7 +1204,7 @@ async function verifySnapshotMode(
       "snapshot trim empties every table outside SNAPSHOT_TABLES",
       populated.length === 0 && others.length > 0,
       populated.length === 0
-        ? `${others.length} tables empty (attendance, slack_*, api_keys, auth.*, history, …)`
+        ? `${others.length} tables empty (slack_*, api_keys, update_requests, auth.*, history, …)`
         : `still populated: ${populated.join(", ")}`,
     );
 
@@ -1135,6 +1275,128 @@ async function verifySnapshotMode(
       `delivered ${published}x; tar [${listing.join(", ")}]; ${tableData} TABLE DATA entries; ` +
         `row counts ${miscounted.length === 0 ? "match" : `differ: ${miscounted.join(", ")}`}`,
     );
+    const attendanceTables = [
+      "public.attendance",
+      "public.attendance_x_attendance_types",
+      "public.achievements_x_users",
+    ];
+    const emptyAttendance = attendanceTables.filter(
+      (t) => !shipped.tables[t]?.rows,
+    );
+    check(
+      "the manifest lists attendance, its types and awards, with rows",
+      emptyAttendance.length === 0,
+      emptyAttendance.length === 0
+        ? attendanceTables
+            .map((t) => `${t}: ${shipped.tables[t]?.rows}`)
+            .join(", ")
+        : `missing or empty: ${emptyAttendance.join(", ")}`,
+    );
+
+    // Must replay RESTORE_SCRIPT in packages/db/src/load-snapshot-lib.ts
+    // (change both together), into a seeded database: only the dump's TABLE
+    // DATA entries, as data-only SQL with triggers off behind a TRUNCATE …
+    // CASCADE of the manifest's tables, applied by psql in one transaction.
+    // With triggers off Postgres checks no FK, so check every one here.
+    const loadUrl = dbUrl(SNAPSHOT_LOAD_DB);
+    const dumpFile = path.join(extracted, "snapshot.dump");
+    const loadList = path.join(work, "load.list");
+    const loadSql = path.join(work, "load.sql");
+    const tocLines = execFileSync(pgRestore, ["-l", dumpFile], {
+      encoding: "utf8",
+    })
+      .split("\n")
+      .filter((l) => /^[0-9]+; [0-9]+ [0-9]+ TABLE DATA /.test(l));
+    writeFileSync(loadList, `${tocLines.join("\n")}\n`);
+    writeFileSync(
+      loadSql,
+      "SET client_min_messages = warning;\n" +
+        `TRUNCATE TABLE ${Object.keys(shipped.tables).map(quoteQualified).join(", ")} CASCADE;\n` +
+        execFileSync(
+          pgRestore,
+          [
+            "--data-only",
+            "--disable-triggers",
+            "--no-owner",
+            "-L",
+            loadList,
+            "-f",
+            "-",
+            dumpFile,
+          ],
+          { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 },
+        ),
+    );
+    const psql = process.env.PG_BIN_DIR
+      ? path.join(process.env.PG_BIN_DIR, "psql")
+      : "psql";
+    const applied = spawnSync(
+      psql,
+      [
+        "-q",
+        "-o",
+        "/dev/null",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "--single-transaction",
+        "-f",
+        loadSql,
+      ],
+      { env: { ...process.env, ...libpqEnv(loadUrl) }, stdio: "pipe" },
+    );
+    if (applied.error) throw applied.error;
+    if (applied.status !== 0) {
+      throw new Error(
+        `psql could not load the published dump (exit ${applied.status}): ${applied.stderr.toString().slice(-500)}`,
+      );
+    }
+    const load = postgres(loadUrl, { max: 1, onnotice: () => undefined });
+    try {
+      const loadMiscounted: string[] = [];
+      for (const [t, { rows }] of Object.entries(shipped.tables)) {
+        const [row] = await load.unsafe<{ n: number }[]>(
+          `SELECT count(*)::int AS n FROM ${quoteQualified(t)}`,
+        );
+        if (row?.n !== rows) loadMiscounted.push(`${t} ${row?.n}/${rows}`);
+      }
+      const dangling: string[] = [];
+      const edges = (await fkEdges(load, ["public"])).filter((e) =>
+        Object.hasOwn(shipped.tables, e.table),
+      );
+      for (const e of edges) {
+        const n = await danglingFor(load, e);
+        if (n) dangling.push(`${e.name} (${n})`);
+      }
+      // Negative control: with triggers off, orphan an attendance row and
+      // the detector must count it.
+      const attEdge = edges.find(
+        (e) =>
+          e.table === "public.attendance" &&
+          e.refTable === "public.event_instances",
+      );
+      const probe = await load.reserve();
+      let caught = 0;
+      try {
+        await probe`BEGIN`;
+        await probe`SET LOCAL session_replication_role = replica`;
+        await probe`
+          DELETE FROM event_instances
+          WHERE id = (SELECT min(event_instance_id) FROM attendance)`;
+        caught = attEdge ? await danglingFor(probe, attEdge) : 0;
+      } finally {
+        await probe`ROLLBACK`;
+        probe.release();
+      }
+      check(
+        "a loaded snapshot matches the manifest's row counts and every FK resolves",
+        loadMiscounted.length === 0 && dangling.length === 0 && caught > 0,
+        `${loadMiscounted.length === 0 ? "counts match" : `counts differ: ${loadMiscounted.join(", ")}`}; ` +
+          `${edges.length} FKs checked, ${dangling.length === 0 ? "none dangling" : `dangling: ${dangling.join(", ")}`}; ` +
+          `orphaned attendance probe ${caught > 0 ? `caught (${caught})` : "NOT caught"}`,
+      );
+    } finally {
+      await load.end();
+    }
 
     const dumpedData = execFileSync(
       pgRestore,
@@ -1183,6 +1445,38 @@ async function verifySnapshotMode(
       floorError.includes("public.event_instances has 0 rows") &&
         floorDelivered === 0,
       `${floorError ? "refused" : "NOT refused"}, delivered ${floorDelivered}x`,
+    );
+
+    // The probe above stops at event_instances, so empty attendance alone.
+    const attReserved = await snap.reserve();
+    let attFloorDelivered = 0;
+    let attFloorError = "";
+    try {
+      await attReserved`BEGIN`;
+      // attendance_x_attendance_types cascades with it.
+      await attReserved`DELETE FROM attendance`;
+      await publishSnapshot({
+        sql: attReserved,
+        copyUrl: snapUrl,
+        work: publishWork,
+        migration: { tag: "harness", createdAt: 0 },
+        window: trim.window,
+        deliver: () => {
+          attFloorDelivered += 1;
+          return Promise.resolve("delivered");
+        },
+      });
+    } catch (e) {
+      attFloorError = e instanceof Error ? e.message : String(e);
+    } finally {
+      await attReserved`ROLLBACK`;
+      attReserved.release();
+    }
+    check(
+      "an empty attendance table stops the snapshot before it is published",
+      attFloorError.includes("public.attendance has 0 rows") &&
+        attFloorDelivered === 0,
+      `${attFloorError ? "refused" : "NOT refused"}, delivered ${attFloorDelivered}x`,
     );
 
     await snap`ALTER TABLE orgs ADD COLUMN snapshot_probe text`;
@@ -1779,6 +2073,15 @@ async function main(): Promise<void> {
       childEnv,
     );
 
+    const [legacyStrava] = await sql<
+      { n: number }[]
+    >`SELECT count(*)::int AS n FROM users u WHERE EXISTS (SELECT 1 FROM jsonb_object_keys(u.meta) k WHERE left(k, 7) = 'strava_')`;
+    check(
+      "legacy Strava metadata removed",
+      legacyStrava?.n === 0,
+      "credential key count only",
+    );
+
     // --- 5. Assertions --------------------------------------------------------
     console.log("\nAssertions:");
 
@@ -2015,16 +2318,136 @@ async function main(): Promise<void> {
 
     // Deterministic cross-table consistency: jane@example.com must map to the
     // same fake in users.email and update_requests.submitted_by.
+    const expectedUserEmail = `${SINK_PREFIX}${userId}${SINK_SUFFIX}`;
     const [fakeUser] = await sql<{ email: string }[]>`
       SELECT email FROM users WHERE id = ${userId}`;
-    const [request] = await sql<{ submitted_by: string }[]>`
-      SELECT submitted_by FROM update_requests
-      WHERE event_name = 'Test Workout' LIMIT 1`;
+    const [request] = await sql<
+      {
+        submitted_by: string;
+        location_description: string | null;
+        ao_website: string | null;
+        event_meta_matches: boolean | null;
+        token_changed: boolean;
+        token_unique: boolean;
+      }[]
+    >`
+      SELECT r.submitted_by, r.location_description, r.ao_website,
+        r.event_meta = ${sql.json({
+          contact: expectedUserEmail,
+          nested: { note: `Email ${expectedUserEmail}` },
+          count: 2,
+          active: true,
+        })}::jsonb AS event_meta_matches,
+        r.token <> ${SYNTHETIC_REQUEST_TOKEN}::uuid AS token_changed,
+        NOT EXISTS (
+          SELECT 1 FROM update_requests AS other
+          WHERE other.id <> r.id AND other.token = r.token
+        ) AS token_unique
+      FROM update_requests AS r WHERE r.id = ${planted.requestId}`;
     check(
       "deterministic cross-table email mapping",
       fakeUser?.email === request?.submitted_by &&
-        fakeUser?.email === `${SINK_PREFIX}${userId}${SINK_SUFFIX}`,
+        fakeUser?.email === expectedUserEmail,
       `users.email=${fakeUser?.email} vs update_requests.submitted_by=${request?.submitted_by}`,
+    );
+
+    const [expansion] = await sql<
+      {
+        user_lat: number;
+        user_lon: number;
+        pinned_lat: number;
+        pinned_lon: number;
+      }[]
+    >`
+      SELECT user_lat, user_lon, pinned_lat, pinned_lon FROM expansions
+      WHERE id = ${planted.expansionId}`;
+    check(
+      "expansion user latitude rounded to one decimal",
+      !!expansion && expansion.user_lat === 35.7,
+      `row ${expansion ? "present" : "missing"}; latitude ${expansion?.user_lat ?? "missing"}`,
+    );
+    check(
+      "expansion user longitude rounded to one decimal",
+      !!expansion && expansion.user_lon === -81,
+      `row ${expansion ? "present" : "missing"}; longitude ${expansion?.user_lon ?? "missing"}`,
+    );
+    check(
+      "expansion pinned coordinates preserved",
+      !!expansion &&
+        expansion.pinned_lat === 35.61234 &&
+        expansion.pinned_lon === -80.93456,
+      `row ${expansion ? "present" : "missing"}; pinned coordinates ${expansion?.pinned_lat ?? "missing"}, ${expansion?.pinned_lon ?? "missing"}`,
+    );
+
+    const [membership] = await sql<{ notes: string | null }[]>`
+      SELECT notes FROM expansions_x_users
+      WHERE expansion_id = ${planted.expansionId} AND user_id = ${userId}`;
+    check(
+      "expansion membership notes cleared to NULL",
+      !!membership && membership.notes === null,
+      `row ${membership ? "present" : "missing"}; notes ${membership?.notes === null ? "NULL" : "not NULL"}`,
+    );
+
+    const [achievement] = await sql<{ description: string | null }[]>`
+      SELECT description FROM achievements
+      WHERE id = ${planted.achievementId}`;
+    check(
+      "achievement description email scrubbed with prose preserved",
+      !!achievement &&
+        achievement.description === `Award contact: ${expectedUserEmail}`,
+      `row ${achievement ? "present" : "missing"}; description ${achievement?.description ?? "missing"}`,
+    );
+
+    const [location] = await sql<
+      { email: string | null; description: string | null }[]
+    >`
+      SELECT email, description FROM locations
+      WHERE id = ${planted.mixedLocationId}`;
+    check(
+      "retained location email rewritten to its row sink",
+      !!location &&
+        location.email ===
+          `${SINK_PREFIX}location-${planted.mixedLocationId}${SINK_SUFFIX}`,
+      `row ${location ? "present" : "missing"}; email ${location?.email ?? "missing"}`,
+    );
+    check(
+      "retained location description replaced with lorem ipsum",
+      !!location &&
+        !!location.description &&
+        location.description.trim().length > 0 &&
+        location.description !== SYNTHETIC_LOCATION_DESCRIPTION &&
+        isLoremText(location.description),
+      `row ${location ? "present" : "missing"}; description ${location?.description ?? "missing"}`,
+    );
+
+    check(
+      "request location description replaced with lorem ipsum",
+      !!request &&
+        !!request.location_description &&
+        request.location_description.trim().length > 0 &&
+        request.location_description !==
+          SYNTHETIC_REQUEST_LOCATION_DESCRIPTION &&
+        isLoremText(request.location_description),
+      `row ${request ? "present" : "missing"}; location description ${request?.location_description ?? "missing"}`,
+    );
+    check(
+      "request AO website email scrubbed with prose preserved",
+      !!request &&
+        request.ao_website ===
+          `Contact ${expectedUserEmail} for the AO website`,
+      `row ${request ? "present" : "missing"}; AO website ${request?.ao_website ?? "missing"}`,
+    );
+    check(
+      "request event metadata scrubbed with structure preserved",
+      !!request && request.event_meta_matches === true,
+      `row ${request ? "present" : "missing"}; metadata ${request?.event_meta_matches === true ? "matches" : "does not match"}`,
+    );
+    check(
+      "request capability token changed and unique",
+      !!request &&
+        request.token_changed === true &&
+        request.token_unique === true,
+      `row ${request ? "present" : "missing"}; token ${request?.token_changed === true ? "changed" : "unchanged"}; unique ${request?.token_unique === true ? "yes" : "no"}`,
     );
 
     const [instance] = await sql<{ backblast: string | null }[]>`
@@ -2499,6 +2922,46 @@ async function main(): Promise<void> {
         : `${preservedHere.length} preserved, fix-ups: ${keptPlan.fixups.map((f) => `${f.table}.${f.column}`).join(", ") || "none"}, ${intoPreserved.size} loaded table(s) into them, all empty`,
     );
 
+    // A JSON string can conceal credentials from object-key filtering.
+    const [metadataBefore] = await sql<{ meta: string | null }[]>`
+      SELECT meta::text AS meta FROM users WHERE id = ${userId}`;
+    if (!metadataBefore)
+      throw new Error("Harness bug: missing metadata fixture");
+    const encodedMetadata = JSON.stringify({
+      strava_access_token: "synthetic-malformed-metadata-token",
+    });
+    try {
+      await sql`UPDATE users SET meta = ${sql.json(encodedMetadata)} WHERE id = ${userId}`;
+      const malformedRun = spawnSync(
+        "pnpm",
+        [
+          "-F",
+          "@acme/scripts",
+          "exec",
+          "tsx",
+          "src/obfuscate-db.ts",
+          "--allow-db",
+          DB_NAME,
+          "--i-understand-this-rewrites-data",
+        ],
+        { cwd: repoRoot, env: { ...process.env, ...childEnv }, stdio: "pipe" },
+      );
+      const output = `${malformedRun.stdout.toString()}${malformedRun.stderr.toString()}`;
+      check(
+        "string-encoded user metadata aborts sanitization with a safe row diagnostic",
+        malformedRun.status !== null &&
+          malformedRun.status !== 0 &&
+          output.includes(
+            `User metadata must be an object or null for sanitization (users.id=${userId})`,
+          ) &&
+          !output.includes(encodedMetadata) &&
+          !output.includes("synthetic-malformed-metadata-token"),
+        `exit ${malformedRun.status}; diagnostic ${output.includes(`users.id=${userId}`) ? "identifies row" : "MISSING"}`,
+      );
+    } finally {
+      await sql`UPDATE users SET meta = ${metadataBefore.meta}::text::jsonb WHERE id = ${userId}`;
+    }
+
     // --- 5a. Unclassified-table gate ------------------------------------------
     // The gate has fired for real (Better Auth schema drift), but only its
     // pass path ran here. Add an unclassified table, plant a real-looking
@@ -2927,9 +3390,10 @@ async function main(): Promise<void> {
         VALUES ('Preservation Fixture', 'Synthetic', 'Person', ${fixture.email},
           '704-555-1234', 'https://example.com/avatar.png', 'Synthetic Contact',
           '704-555-9999', 'Call profile-contact@example.com',
-          ${sql.json({ owner: fixture.email, contact: "profile-contact@example.com" })})
+          ${sql.json({ owner: fixture.email, contact: "profile-contact@example.com", strava_access_token: "synthetic-access", strava_refresh_token: "synthetic-refresh", strava_future: "synthetic-future" })})
         RETURNING id`;
       if (!user) throw new Error(`Failed to plant ${fixture.label} user`);
+      await sql`INSERT INTO user_strava_credentials (user_id, athlete_id, access_token, refresh_token, expires_at) VALUES (${user.id}, ${user.id}, 'synthetic-access', 'synthetic-refresh', 2000000000)`;
       await sql`
         INSERT INTO auth.better_auth_user (id, name, email, email_verified, image,
           created_at, updated_at)
@@ -3016,6 +3480,14 @@ async function main(): Promise<void> {
         "--preserve-local-seed",
       ],
       { cwd: repoRoot, env: { ...process.env, ...childEnv }, stdio: "pipe" },
+    );
+    const [preservedStrava] = await sql<
+      { n: number }[]
+    >`SELECT (SELECT count(*) FROM user_strava_credentials)::int + (SELECT count(*) FROM users u WHERE EXISTS (SELECT 1 FROM jsonb_object_keys(u.meta) k WHERE left(k, 7) = 'strava_'))::int AS n`;
+    check(
+      "preserve-local-seed removes every Strava connection",
+      preservedStrava?.n === 0,
+      "credential row/key count only",
     );
     for (const fixture of preserveUsers) {
       const [user] = await sql<

@@ -50,7 +50,11 @@ for every session hop:
    list more than one issuer; each token is checked against the JWKS of the
    allowlisted issuer its `iss` names (`packages/api/src/trusted-issuers.ts`).
    Entries are bare origins, so an auth server must sign `iss` as its bare
-   origin for its tokens to verify.
+   origin for its tokens to verify. The token's `client_id` must also be in
+   `AUTH_TRUSTED_CLIENT_IDS` (`packages/api/src/trusted-client-ids.ts`), which
+   `.github/preview/api-service.template.yaml` sets to seeded client ids; the
+   client [Recipe 3](#recipe-3--auth-server-jwt-for-api-bearer-auth-full-sso-loop)
+   signs in through must be one of them.
 
 4. **The admin app (not yet in previews) also needs no shared cookie.** It
    runs an OAuth authorization-code flow against `AUTH_PROVIDER_URL`, stores
@@ -61,7 +65,7 @@ for every session hop:
 5. **The auth server's own session cookie is host-only by design** — no
    `domain` attribute at all (`apps/auth/src/lib/auth-options.ts:21-32`). In
    the preview image `NODE_ENV=production`, so the cookie is named
-   `__session` (`Secure`, `SameSite=None`).
+   `__session` (`Secure`, `SameSite=Lax`).
 
 Conclusion: previews use **bearer JWTs and server-side cookie forwarding**,
 never shared browser cookies. Browser SSO across preview apps (e.g. sign in
@@ -241,7 +245,7 @@ tmpfs sidecar, never real data. That's the one load-bearing assumption:
   email (new-user MFA send, magic links for arbitrary addresses) fails in
   previews. Use the fixture code `424242` with the seeded dev users.
 - **`NODE_ENV=production` semantics** in the auth image: session cookie is
-  `__session` (Secure, SameSite=None), and the `/api/verify-email` rate limit
+  `__session` (Secure, SameSite=Lax), and the `/api/verify-email` rate limit
   (10/min/IP) is active — irrelevant when using the fixture-code recipe.
 - **MFA fixture codes are finite per warm instance** (40 per dev user,
   consume-once). Practically unlimited for E2E runs; a cold start (scale to

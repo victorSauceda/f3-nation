@@ -8,7 +8,6 @@ import hashlib
 import json
 import random
 import re
-import shutil
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from math import isnan
@@ -31,8 +30,6 @@ from f3_data_models.models import (
     SlackSpace,
     User,
 )
-
-# import dataframe_image as dfi
 from f3_data_models.utils import DbManager, get_session
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -40,17 +37,18 @@ from slack_sdk.models import blocks
 from sqlalchemy import Integer, and_, bindparam, func, or_, select
 from sqlalchemy.orm import aliased, joinedload
 
+from scripts.calendar_render import export_table_png
+from utilities import storage
 from utilities.constants import (
     EVENT_TAG_COLORS,
-    GCP_IMAGE_URL,
     LOCAL_DEVELOPMENT,
     MAX_CALENDAR_WEEKS,
-    S3_IMAGE_URL,
     WEEK_ALT_TEXT,
     WEEK_LABELS,
 )
 from utilities.helper_functions import current_date_cst, safe_convert, update_local_region_records
 from utilities.slack import actions
+from utilities.slack.sdk_orm import image_or_link_block
 
 DB_SCHEMA = os.getenv("DATABASE_SCHEMA", "f3_staging")
 CALENDAR_REGION_BIND_PARAMETER = "calendar_region_id"
@@ -211,6 +209,17 @@ def set_text_color(s, color_dicts):
     return text_color_list
 
 
+def _style_calendar_table(df, styles, color_dicts):
+    # Table text comes from user-edited records; escape every cell and header before Chromium renders it.
+    return (
+        df.style.format(escape="html")
+        .format_index(escape="html", axis=1)
+        .set_table_styles(styles)
+        .apply(highlight_cells, color_dicts=color_dicts)
+        .hide(axis="index")
+    )
+
+
 def _remove_week_image(
     slack_app_settings: dict,
     region_id: int,
@@ -221,8 +230,6 @@ def _remove_week_image(
     """Remove settings and queue file cleanup, including stable-file retries."""
     removed = f"calendar_image_{week}" in slack_app_settings
     stale_file = slack_app_settings.pop(f"calendar_image_{week}", None)
-    if LOCAL_DEVELOPMENT:
-        return removed
     query_started_at = query_started_at or datetime.now(UTC)
     stale_filenames = (
         [stale_file] if calendar_image_is_safe_to_delete(stale_file, region_id, week, query_started_at) else []
@@ -235,11 +242,11 @@ def _remove_week_image(
         return removed
     for filename in stale_filenames:
         try:
-            os.remove(f"/mnt/calendar-images/{filename}")
+            storage.delete(storage.CALENDAR_IMAGES, filename)
         except FileNotFoundError:
             pass
         except Exception as e:
-            print(f"Error deleting stale file {filename} from local storage: {e}")
+            print(f"Error deleting stale file {filename} from storage: {e}")
     return removed
 
 
@@ -282,20 +289,13 @@ def _slack_attempt_was_rejected(error: Exception) -> bool:
 def post_calendar_to_slack(slack_app_settings: dict, num_weeks: int, first_sunday_run: bool, session=None) -> None:
     print("Posting to Slack channel")
     client = WebClient(token=slack_app_settings["bot_token"])
-    if LOCAL_DEVELOPMENT:
-        IMAGE_URL = S3_IMAGE_URL
-    else:
-        IMAGE_URL = GCP_IMAGE_URL
     block_list = [blocks.HeaderBlock(text=":calendar: Q Calendar")]
     for week in WEEK_LABELS[:num_weeks]:
         image_name = slack_app_settings.get(f"calendar_image_{week}")
         if image_name:
             block_list.append(
-                blocks.ImageBlock(
-                    image_url=IMAGE_URL.format(
-                        bucket="f3nation-calendar-images",
-                        image_name=image_name,
-                    ),
+                image_or_link_block(
+                    image_url=storage.public_url(storage.CALENDAR_IMAGES, image_name),
                     alt_text=WEEK_ALT_TEXT[week],
                 )
             )
@@ -467,7 +467,6 @@ def _build_calendar_query(session, current_week_start, overall_end):
 
 
 def generate_calendar_images(force: bool = False):
-    import dataframe_image as dfi
     import pandas as pd
 
     with get_session() as session:
@@ -735,11 +734,7 @@ def generate_calendar_images(force: bool = False):
                             # set style and export png
                             # df_styled = df2.style.set_table_styles(styles).apply(highlight_cells).hide_index()
                             # apply styles, hide the index
-                            df_styled = (
-                                df2.style.set_table_styles(styles)
-                                .apply(highlight_cells, color_dicts=all_color_dicts)
-                                .hide(axis="index")
-                            )
+                            df_styled = _style_calendar_table(df2, styles, all_color_dicts)
                             df_styled = df_styled.apply(set_text_color, color_dicts=all_color_dicts, axis=1)
 
                             # create calendar image
@@ -750,21 +745,14 @@ def generate_calendar_images(force: bool = False):
                                 f"{fingerprint}-{random_chars}.png"
                             )
                             filename_static = f"{region_id}-{week}.png"
-                            if LOCAL_DEVELOPMENT:
-                                dfi.export(df_styled, filename, table_conversion="playwright")
-                                generated_backing_files.append((week, filename))
-                            else:
-                                dfi.export(df_styled, f"/mnt/calendar-images/{filename}", table_conversion="playwright")
-                                generated_backing_files.append((week, filename))
-                                if DB_SCHEMA == "f3_prod":
-                                    shutil.copyfile(
-                                        f"/mnt/calendar-images/{filename}", f"/mnt/calendar-images/{filename_static}"
-                                    )
+                            with storage.writable_path(storage.CALENDAR_IMAGES, filename, "image/png") as path:
+                                export_table_png(df_styled, path)
+                            generated_backing_files.append((week, filename))
+                            if DB_SCHEMA == "f3_prod":
+                                storage.copy(storage.CALENDAR_IMAGES, filename, filename_static)
 
                             existing_file = slack_app_settings.get(f"calendar_image_{week}")
-                            if not LOCAL_DEVELOPMENT and calendar_image_is_safe_to_delete(
-                                existing_file, region_id, week, generation_started_at
-                            ):
+                            if calendar_image_is_safe_to_delete(existing_file, region_id, week, generation_started_at):
                                 pending_deletions.append(existing_file)
                             slack_app_settings[f"calendar_image_{week}"] = filename
                             calendar_updated = True
@@ -787,14 +775,15 @@ def generate_calendar_images(force: bool = False):
                                     ]:
                                         continue
                                     try:
-                                        os.remove(new_file if LOCAL_DEVELOPMENT else f"/mnt/calendar-images/{new_file}")
+                                        storage.delete(storage.CALENDAR_IMAGES, new_file)
                                     except FileNotFoundError:
                                         pass
                                     except Exception as cleanup_error:
                                         print(f"Error deleting unposted calendar image: {cleanup_error}")
                                 raise
 
-                        print(f"Updating Slack app settings for region {region_name} with {slack_app_settings}")
+                        # Settings hold the bot token and SMTP password; never print them.
+                        print(f"Updating Slack app settings for region {region_name}")
                         session.query(SlackSpace).filter(SlackSpace.team_id == slack_app_settings["team_id"]).update(
                             {"settings": slack_app_settings}
                         )
@@ -835,7 +824,7 @@ def generate_calendar_images(force: bool = False):
                             ):
                                 continue
                         try:
-                            os.remove(f"/mnt/calendar-images/{old_file}")
+                            storage.delete(storage.CALENDAR_IMAGES, old_file)
                         except FileNotFoundError:
                             pass
                         except Exception as e:
@@ -851,6 +840,8 @@ def generate_calendar_images(force: bool = False):
 def create_special_events_text(events: List[EventInstance], slack_settings_dict: dict, max_events: int = 10) -> str:
     text = ""
     special_days_out = slack_settings_dict.get("calendar_config_special_days_out")
+    if special_days_out == 0:
+        return ""
     if special_days_out is not None:
         events = [e for e in events if (e.start_date - current_date_cst()).days <= special_days_out]
 
@@ -890,9 +881,9 @@ def create_special_events_blocks(slack_settings_dict: dict, session=None) -> blo
         special_events = session.query(EventInstance).options(joinedload(EventInstance.org)).filter(*filters).all()
     # limit to 10 upcoming events
     special_events = sorted(special_events, key=lambda x: (x.start_date, x.start_time))[:10]
-    if len(special_events) > 0:
+    msg = create_special_events_text(special_events, slack_settings_dict)
+    if msg:
         blocks_list.append(blocks.HeaderBlock(text=":tada: Special Events:"))
-        msg = create_special_events_text(special_events, slack_settings_dict)
         blocks_list.append(blocks.SectionBlock(text=blocks.MarkdownTextObject(text=msg)))
     return blocks_list
 

@@ -24,9 +24,6 @@ export type IsActiveStatus = (typeof IsActiveStatus)[number];
 export const UpdateRequestStatus = ["pending", "approved", "rejected"] as const;
 export type UpdateRequestStatus = (typeof UpdateRequestStatus)[number];
 
-export const Permissions = ["admin", "edit"] as const;
-export type Permissions = (typeof Permissions)[number];
-
 // Ordered leaf (ao) -> root (nation). Array order is load-bearing: rank
 // (see org-hierarchy.ts) derives from index, and the index order must match
 // the Postgres "org_type" enum's declared sort order (packages/db/drizzle
@@ -116,21 +113,6 @@ export enum EventTypes {
   // Obstacle Training // Gear
   // Strength/Conditioning/Tabata/WIB // Bootcamp
   // Mobility/Stretch // Mobility
-}
-
-export enum EventTags {
-  Open = "Open",
-  VQ = "VQ",
-  Manniversary = "Manniversary",
-  Convergence = "Convergence",
-}
-
-export enum EventCategories {
-  "1st F - Core Workout" = "1st F - Core Workout",
-  "1st F - Pre Workout" = "1st F - Pre Workout",
-  "1st F - Off the books" = "1st F - Off the books",
-  "2nd F - Fellowship" = "2nd F - Fellowship",
-  "3rd F - Faith" = "3rd F - Faith",
 }
 
 export const FeedbackType = [

@@ -1,6 +1,12 @@
 "use client";
 
-import { Suspense, useState, useEffect, useRef } from "react";
+import {
+  Suspense,
+  useState,
+  useEffect,
+  useRef,
+  useSyncExternalStore,
+} from "react";
 import { signIn } from "next-auth/react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { isValidPhoneNumber } from "libphonenumber-js";
@@ -21,6 +27,12 @@ import { authClient } from "~/lib/better-auth-client";
 // emergency contact stay out of it: browser storage is plain text, and those
 // are worth retyping rather than leaving behind on a shared computer.
 const DRAFT_KEY = "f3-register-draft";
+
+const subscribeToHydration = () => () => {
+  // Hydration changes the snapshot once; no external events need a listener.
+};
+const clientSnapshot = () => true;
+const serverSnapshot = () => false;
 
 interface RegisterDraft {
   email: string;
@@ -64,9 +76,18 @@ export default function RegisterForm({
 }) {
   return (
     <Suspense>
-      <RegisterFormInner useBetterAuth={useBetterAuth} />
+      <RegistrationAttempt useBetterAuth={useBetterAuth} />
     </Suspense>
   );
+}
+
+function RegistrationAttempt({ useBetterAuth }: { useBetterAuth: boolean }) {
+  const searchParams = useSearchParams();
+  const attemptKey = JSON.stringify([
+    searchParams.get("email"),
+    searchParams.get("code"),
+  ]);
+  return <RegisterFormInner key={attemptKey} useBetterAuth={useBetterAuth} />;
 }
 
 function RegisterFormInner({ useBetterAuth }: { useBetterAuth: boolean }) {
@@ -88,39 +109,63 @@ function RegisterFormInner({ useBetterAuth }: { useBetterAuth: boolean }) {
     useState<PhoneCountry>("US");
   const [emergencyNotes, setEmergencyNotes] = useState("");
 
+  const [regionsLoaded, setRegionsLoaded] = useState(false);
+  const [regionError, setRegionError] = useState("");
   const [regions, setRegions] = useState<Region[]>([]);
   const [loading, setLoading] = useState(false);
+  const [registrationComplete, setRegistrationComplete] = useState(false);
   const [error, setError] = useState("");
   const [needsSignInAgain, setNeedsSignInAgain] = useState(false);
   const [showEmergency, setShowEmergency] = useState(false);
   const [regionSearch, setRegionSearch] = useState("");
   const submittingRef = useRef(false);
+  const hydrated = useSyncExternalStore(
+    subscribeToHydration,
+    clientSnapshot,
+    serverSnapshot,
+  );
+  const [initialized, setInitialized] = useState(false);
+
+  // Apply browser phone defaults and restore matching saved answers after
+  // hydration, once per attempt so ordinary rerenders preserve user edits.
+  if (hydrated && !initialized) {
+    setInitialized(true);
+    const detectedCountry = detectPhoneCountry(navigator.language);
+    setPhoneCountry(detectedCountry);
+    setEmergencyPhoneCountry(detectedCountry);
+    const draft = loadDraft(email);
+    if (draft) {
+      setF3Name(draft.f3Name);
+      setFirstName(draft.firstName);
+      setLastName(draft.lastName);
+      setHomeRegionId(draft.homeRegionId);
+      setRegionSearch(draft.regionSearch);
+    }
+  }
+
+  if (
+    regionsLoaded &&
+    homeRegionId !== "" &&
+    !regions.some((region) => region.id === homeRegionId)
+  ) {
+    setHomeRegionId("");
+    setRegionSearch("");
+    setRegionError(
+      "That region is no longer available. Please choose another.",
+    );
+  }
 
   useEffect(() => {
     fetch("/api/regions")
       .then((res) => res.json())
-      .then((data: Region[]) => setRegions(data))
+      .then((data: Region[]) => {
+        setRegions(data);
+        setRegionsLoaded(true);
+      })
       .catch(() => {
         /* regions are optional */
       });
   }, []);
-
-  useEffect(() => {
-    const detectedCountry = detectPhoneCountry(navigator.language);
-    setPhoneCountry(detectedCountry);
-    setEmergencyPhoneCountry(detectedCountry);
-  }, []);
-
-  // Restore the answers saved when an earlier code was rejected.
-  useEffect(() => {
-    const draft = loadDraft(email);
-    if (!draft) return;
-    setF3Name(draft.f3Name);
-    setFirstName(draft.firstName);
-    setLastName(draft.lastName);
-    setHomeRegionId(draft.homeRegionId);
-    setRegionSearch(draft.regionSearch);
-  }, [email]);
 
   // If no email or code, redirect back to login
   useEffect(() => {
@@ -135,6 +180,7 @@ function RegisterFormInner({ useBetterAuth }: { useBetterAuth: boolean }) {
 
     setLoading(true);
     setError("");
+    setRegionError("");
 
     if (!firstName.trim() || !lastName.trim()) {
       setError("First name and last name are required.");
@@ -185,6 +231,19 @@ function RegisterFormInner({ useBetterAuth }: { useBetterAuth: boolean }) {
         const data = (await res.json().catch(() => ({}))) as {
           error?: string;
         };
+        if (
+          res.status === 400 &&
+          data.error ===
+            "That region is no longer available. Please choose another."
+        ) {
+          setRegions((choices) =>
+            choices.filter((region) => region.id !== homeRegionId),
+          );
+          setHomeRegionId("");
+          setRegionSearch("");
+          setRegionError(data.error);
+          return;
+        }
         setError(data.error ?? "Registration failed. Please try again.");
         // A rejected code can't be fixed from this form: keep the answers
         // for this tab and offer a fresh code.
@@ -248,6 +307,7 @@ function RegisterFormInner({ useBetterAuth }: { useBetterAuth: boolean }) {
         ? callbackUrl
         : "/";
       router.push(safeUrl);
+      setRegistrationComplete(true);
     } catch {
       if (accountCreated) {
         setError(
@@ -258,7 +318,8 @@ function RegisterFormInner({ useBetterAuth }: { useBetterAuth: boolean }) {
         setError("Something went wrong. Please try again.");
       }
     } finally {
-      submittingRef.current = false;
+      // A confirmed account must not be registered again, even before navigation unmounts the form.
+      submittingRef.current = accountCreated;
       setLoading(false);
     }
   }
@@ -343,12 +404,21 @@ function RegisterFormInner({ useBetterAuth }: { useBetterAuth: boolean }) {
             <RegionPicker
               regions={regions}
               value={homeRegionId}
-              onChange={setHomeRegionId}
+              onChange={(value) => {
+                setHomeRegionId(value);
+                setRegionError("");
+              }}
               search={regionSearch}
               onSearchChange={setRegionSearch}
               inputClass={inputClass}
               placeholder="Search for a region (optional)"
             />
+
+            {regionError && (
+              <p role="alert" className="text-base text-destructive">
+                {regionError}
+              </p>
+            )}
 
             <div>
               <PhoneField
@@ -443,7 +513,7 @@ function RegisterFormInner({ useBetterAuth }: { useBetterAuth: boolean }) {
 
             <button
               type="submit"
-              disabled={loading || needsSignInAgain}
+              disabled={loading || needsSignInAgain || registrationComplete}
               className="w-full rounded-md bg-primary px-4 py-3 text-base font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
             >
               {loading ? "Creating Account..." : "Create Account"}

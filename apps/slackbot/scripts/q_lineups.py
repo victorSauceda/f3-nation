@@ -1,5 +1,4 @@
 import os
-import ssl
 import sys
 from logging import Logger
 
@@ -23,6 +22,7 @@ from slack_sdk.models.metadata import Metadata
 from sqlalchemy import or_
 
 from scripts.preblast_reminders import PreblastItem, PreblastList
+from utilities import storage
 from utilities.database.orm import SlackSettings
 from utilities.helper_functions import (
     current_date_cst,
@@ -158,11 +158,11 @@ def build_lineup_blocks(org_events: List[PreblastItem], org: Org) -> List[dict]:
         if event.q_name:
             q_label = f"@{event.q_name}"  # f"<@{event.slack_user_id}>" if event.slack_user_id else
             label = f"*{event.event.start_date.strftime('%A, %m/%d')}*\n{event.event_type.name} {event.event.start_time}\n{q_label}"  # noqa
-            image_url = (
-                event.slack_avatar_url
-                or event.q_avatar_url
-                or "https://www.publicdomainpictures.net/pictures/40000/t2/question-mark.jpg"
-            )
+            placeholder_url = "https://www.publicdomainpictures.net/pictures/40000/t2/question-mark.jpg"
+            image_url = event.slack_avatar_url or event.q_avatar_url or placeholder_url
+            # Slack rejects the whole message if it can't download an image (local emulator avatars).
+            if not storage.is_publicly_reachable(image_url):
+                image_url = placeholder_url
             accessory = ImageBlock(
                 image_url=image_url,
                 alt_text="Q Lineup",
@@ -228,10 +228,7 @@ def send_q_lineup_message(
         metadata.event_payload["week_start"] = week_start.strftime("%y-%m-%d")
         metadata.event_payload["week_end"] = week_end.strftime("%y-%m-%d")
     if slack_bot_token:
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-        slack_client = WebClient(slack_bot_token, ssl=ssl_context)
+        slack_client = WebClient(slack_bot_token)
         if update_channel_id:
             channel_id = update_channel_id
         if slack_settings.send_q_lineups_method == "yes_per_ao" and safe_get(org.meta, "slack_channel_id"):

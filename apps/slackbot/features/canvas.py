@@ -1,4 +1,3 @@
-import ssl
 from datetime import timedelta
 from logging import Logger
 from typing import List
@@ -8,7 +7,7 @@ from f3_data_models.utils import DbManager
 from slack_sdk import WebClient
 from sqlalchemy import or_
 
-from utilities.constants import GCP_IMAGE_URL
+from utilities import storage
 from utilities.database.orm import SlackSettings
 from utilities.database.special_queries import get_position_users
 from utilities.helper_functions import current_date_cst, safe_get
@@ -36,12 +35,10 @@ def update_canvas(body: dict, client: WebClient, logger: Logger, context: dict, 
     # show calendar image
     msg = "# :calendar: This Week\n\n"
     if region_record.calendar_image_current:
-        msg += "![This Week]("
-        msg += GCP_IMAGE_URL.format(
-            bucket="f3nation-calendar-images",
-            image_name=region_record.calendar_image_current,
-        )
-        msg += ")\n\n"
+        image_url = storage.public_url(storage.CALENDAR_IMAGES, region_record.calendar_image_current)
+        # Slack can't download emulator URLs, so link to them instead of embedding.
+        msg += f"![This Week]({image_url})" if storage.is_publicly_reachable(image_url) else f"[This Week]({image_url})"
+        msg += "\n\n"
 
     # list special events
     special_events: List[EventInstance] = DbManager.find_records(
@@ -112,10 +109,7 @@ def update_all_canvases():
     for region in regions:
         slack_settings = SlackSettings(**region.slack_space.settings)
         if slack_settings.canvas_channel and slack_settings.special_events_enabled:
-            ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
-            client = WebClient(token=slack_settings.bot_token, ssl=ssl_context)
+            client = WebClient(token=slack_settings.bot_token)
             try:
                 update_canvas({}, client, Logger("logger"), {}, slack_settings)
             except Exception as e:

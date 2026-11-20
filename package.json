@@ -4,9 +4,9 @@
   "private": true,
   "type": "module",
   "engines": {
-    "node": ">=24.22.1 <25"
+    "node": "^26.13.0"
   },
-  "packageManager": "pnpm@12.14.0+sha512.c18ba6d87993d3d164cb5e8948f32b2c06ee854487e06cd8d86781342fb3e5bb4634367034711e86802baa9c37bea906ce1929ad08d70884c97d801df13389a6",
+  "packageManager": "pnpm@12.18.0+sha512.9d7882d5dc82147ecfc4e062aa34834e0ad0296710a1837a1115ae012127d36b7109e321ac1598a1dd0a65597681b1e99917e12ed0d749eae91187943363beb3",
   "scripts": {
     "build": "turbo build",
     "ci:local": "pnpm format && pnpm lint && pnpm lint:unused && pnpm typecheck && pnpm build && pnpm test",
@@ -38,10 +38,12 @@
     "lint": "bash scripts/lint.sh",
     "local:setup": "bash scripts/local-setup.sh",
     "postinstall": "bash scripts/postinstall-uv-sync.sh",
-    "pr:triage": "bash scripts/pr-triage.sh",
-    "pr:triage:html": "bash scripts/pr-triage.sh --html",
+    "pr:triage": "bash scripts/pr-triage.sh --with-advisories",
+    "pr:triage:html": "bash scripts/pr-triage.sh --with-advisories --html",
     "python:install": "uv sync --all-packages",
     "reset-test-db": "turbo run reset-test-db",
+    "skills:check": "skills check",
+    "skills:update": "skills update -y -p",
     "test": "turbo test",
     "test:characterization": "turbo test:characterization",
     "typecheck": "turbo typecheck"
@@ -59,8 +61,10 @@
     "knip": "catalog:",
     "lefthook": "catalog:",
     "prettier": "catalog:",
+    "skills": "catalog:",
     "turbo": "catalog:",
-    "typescript": "catalog:"
+    "typescript": "catalog:",
+    "vitest": "catalog:"
   },
   "config": {
     "commitizen": {

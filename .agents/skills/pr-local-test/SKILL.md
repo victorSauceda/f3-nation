@@ -1,6 +1,6 @@
 ---
 name: pr-local-test
-description: Use when the user wants a GitHub pull request pulled down and tested hands-on in their local dev environment ("test PR #N locally", "verify PR N on my machine", "QA this PR", "run through PR N before I approve it"), possibly several PRs in parallel, or wants leftover pr-local-test sandboxes listed or cleaned up. Not for code-only reviews without running anything — use pr-review-inline.
+description: 'Use when the user wants a GitHub pull request pulled down and tested hands-on in their local dev environment ("test PR #N locally", "verify PR N on my machine", "QA this PR", "run through PR N before I approve it"), possibly several PRs in parallel, or wants leftover pr-local-test sandboxes listed or cleaned up. Not for code-only reviews without running anything — use pr-review-inline.'
 compatibility: macOS, Linux, or WSL 2 with bash, git, gh (authenticated), jq, curl, openssl, Docker, and lsof or ss. Browser checks use a Playwright tool or the Playwright CLI if available; otherwise those checks go to the user.
 ---
 
@@ -117,7 +117,7 @@ from the PR's Dockerfiles, claims a free port block, and creates a detached work
 - Exit code 3 with `NODE_MISSING=<v>`: the PR needs a Node version that isn't installed. Stop
   and give the install command for the user's version manager from `reference.md` → **Node**.
   Installing is enough; the user's default version stays as it is. `NODE_UNKNOWN`: ask which
-  version to use. `PNPM_MISSING`: tell the user to run `corepack enable`.
+  version to use. `PNPM_MISSING`: tell the user to run `npm install -g corepack && corepack enable`.
 - `PR_STATE` isn't `OPEN`: say so and ask before going on; on "no", clean up.
 - `WARN=` lines and a `.nvmrc` fallback note go in the plan's mismatch box.
 - `ACTIVE_RUNS` of 4 or more: say in the plan that the machine may be slow.
