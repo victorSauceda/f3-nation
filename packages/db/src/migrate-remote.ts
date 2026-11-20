@@ -551,12 +551,15 @@ export async function migrateRemote(target: RemoteEnvironment): Promise<void> {
     // Migrations alter tables, types and functions, create objects in the
     // schemas and sometimes create schemas: the login must own every such
     // object (extension members aside, e.g. citext's) and may create in them.
+    // A schema that does not exist yet (codex on a database never provisioned
+    // from the Codex dump) contributes nothing; one that does must be reachable
+    // through the owner role, here app_codex.
     const [owner] = await ro<
       { n: number; owners: string | null; missing: string | null }[]
     >`
       WITH schemas AS (
         SELECT oid, nspname FROM pg_namespace
-        WHERE nspname IN ('public', 'auth', 'slackbot', 'drizzle')
+        WHERE nspname IN ('public', 'auth', 'slackbot', 'drizzle', 'codex')
       ), objects AS (
         SELECT c.relowner AS owner, 'pg_class'::regclass AS cls, c.oid
         FROM pg_class c JOIN schemas s ON s.oid = c.relnamespace

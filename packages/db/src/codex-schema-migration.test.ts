@@ -5,8 +5,9 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 // Migration 0038 has to behave differently depending on what it finds: no
 // codex schema (bootstrap), a codex schema from the Codex dump that lacks keys
 // (repair), or a fully provisioned one (no-op). A real Postgres runs each path
-// so the catalog-guarded plpgsql is exercised as written. PGlite has a single
-// superuser, so the ownership rules the header describes are not modelled.
+// so the catalog-guarded plpgsql is exercised as written. The ownership rules
+// the header describes are driven with SET ROLE to a non-superuser that is, or
+// is not, a member of app_codex.
 const MIGRATION = readFileSync(
   new URL("../drizzle/0038_codex_schema.sql", import.meta.url),
   "utf8",
@@ -106,7 +107,22 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
+  await db.exec("RESET ROLE");
   await db.exec("DROP SCHEMA IF EXISTS codex CASCADE");
+  // DROP OWNED also revokes the database-level CREATE grants the role tests
+  // hand out, which would otherwise block DROP ROLE.
+  await db.exec(`
+    DO $$
+    DECLARE r text;
+    BEGIN
+      FOREACH r IN ARRAY ARRAY['migrator', 'app_codex'] LOOP
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN
+          EXECUTE format('DROP OWNED BY %I CASCADE', r);
+          EXECUTE format('DROP ROLE %I', r);
+        END IF;
+      END LOOP;
+    END $$;
+  `);
 });
 
 describe("migration 0038_codex_schema", () => {
@@ -207,5 +223,153 @@ describe("migration 0038_codex_schema", () => {
       "ALTER TABLE codex.tags ADD CONSTRAINT tags_name_unique CHECK (name <> '')",
     );
     await expect(migrate()).rejects.toThrow(/tags_name_unique/);
+  });
+
+  it("refuses a primary key with the expected name over other columns", async () => {
+    await db.exec(LEGACY_SCHEMA);
+    await db.exec(
+      "ALTER TABLE codex.tags ADD CONSTRAINT tags_pkey PRIMARY KEY (name)",
+    );
+    await expect(migrate()).rejects.toThrow(
+      /codex\.tags: constraint tags_pkey covers \(name\) but migration 0038 expects \(id\)/,
+    );
+  });
+
+  it("refuses a unique key with the expected name over other columns", async () => {
+    await db.exec(LEGACY_SCHEMA);
+    await db.exec(
+      "ALTER TABLE codex.entry_references ADD CONSTRAINT unique_source_target UNIQUE (source_entry_id)",
+    );
+    await expect(migrate()).rejects.toThrow(
+      /constraint unique_source_target covers \(source_entry_id\) but migration 0038 expects \(source_entry_id, target_entry_id\)/,
+    );
+  });
+
+  it("refuses an expected index name that sits on another column", async () => {
+    await db.exec(LEGACY_SCHEMA);
+    await db.exec(
+      "CREATE INDEX idx_entry_tags_tag_id ON codex.entry_tags (entry_id)",
+    );
+    await expect(migrate()).rejects.toThrow(
+      /codex\.idx_entry_tags_tag_id exists but is not a valid btree index on codex\.entry_tags\(tag_id\)/,
+    );
+  });
+
+  it("refuses an expected index name held by a non-index relation", async () => {
+    await db.exec(LEGACY_SCHEMA);
+    await db.exec("CREATE SEQUENCE codex.idx_entry_references_target_entry_id");
+    await expect(migrate()).rejects.toThrow(
+      /codex\.idx_entry_references_target_entry_id exists but is not a valid btree index/,
+    );
+  });
+
+  describe("final verification on its own", () => {
+    const verify = () => db.exec(STATEMENTS.at(-1) ?? "");
+
+    it("passes on a fully provisioned schema", async () => {
+      await migrate();
+      await expect(verify()).resolves.toBeDefined();
+    });
+
+    it("fails when a key covers the wrong columns", async () => {
+      await migrate();
+      await db.exec(`
+        ALTER TABLE codex.tags DROP CONSTRAINT tags_pkey;
+        ALTER TABLE codex.tags ADD CONSTRAINT tags_pkey PRIMARY KEY (name);
+      `);
+      await expect(verify()).rejects.toThrow(
+        /missing constraints required by migration 0038: tags_pkey/,
+      );
+    });
+
+    it("fails when an index name sits on another column", async () => {
+      await migrate();
+      await db.exec(`
+        DROP INDEX codex.idx_entry_tags_tag_id;
+        CREATE INDEX idx_entry_tags_tag_id ON codex.entry_tags (entry_id);
+      `);
+      await expect(verify()).rejects.toThrow(
+        /missing indexes required by migration 0038: idx_entry_tags_tag_id/,
+      );
+    });
+  });
+
+  describe("as a non-superuser migration role", () => {
+    // A superuser passes every ownership check, so these drive the paths the
+    // header describes with a role that has no special rights of its own.
+    const asMigrator = async (member: boolean) => {
+      await db.exec(`
+        CREATE ROLE app_codex;
+        CREATE ROLE migrator LOGIN;
+        GRANT CREATE ON DATABASE postgres TO migrator, app_codex;
+      `);
+      if (member) await db.exec("GRANT app_codex TO migrator");
+      await db.exec("SET ROLE migrator");
+    };
+    const owners = async () => {
+      await db.exec("RESET ROLE");
+      const { rows } = await db.query<{ owner: string }>(`
+        SELECT DISTINCT pg_get_userbyid(relowner) AS owner FROM pg_class
+        WHERE relnamespace = 'codex'::regnamespace AND relkind IN ('r', 'S')
+        UNION ALL
+        SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname = 'codex'`);
+      return [...new Set(rows.map((r) => r.owner))];
+    };
+
+    it("hands a bootstrapped schema, its tables and sequences to app_codex", async () => {
+      await asMigrator(true);
+      await migrate();
+      expect(await owners()).toEqual(["app_codex"]);
+    });
+
+    it("keeps the migration role as owner when no app_codex role exists", async () => {
+      await db.exec(`
+        CREATE ROLE migrator LOGIN;
+        GRANT CREATE ON DATABASE postgres TO migrator;
+        SET ROLE migrator;
+      `);
+      await migrate();
+      expect(await owners()).toEqual(["migrator"]);
+    });
+
+    it("fails the bootstrap when app_codex exists but the migrator is not a member", async () => {
+      await asMigrator(false);
+      await expect(migrate()).rejects.toThrow(
+        /role app_codex exists but migrator is not a member of it/,
+      );
+    });
+
+    it("repairs an app_codex-owned schema through membership alone", async () => {
+      await db.exec("CREATE ROLE app_codex; CREATE ROLE migrator LOGIN;");
+      await db.exec("GRANT CREATE ON DATABASE postgres TO app_codex");
+      await db.exec(LEGACY_SCHEMA);
+      await db.exec(`
+        ALTER SCHEMA codex OWNER TO app_codex;
+        ALTER TABLE codex.admins OWNER TO app_codex;
+        ALTER TABLE codex.entries OWNER TO app_codex;
+        ALTER TABLE codex.entry_references OWNER TO app_codex;
+        ALTER TABLE codex.entry_tags OWNER TO app_codex;
+        ALTER TABLE codex."references" OWNER TO app_codex;
+        ALTER TABLE codex.tags OWNER TO app_codex;
+        ALTER TABLE codex.user_submissions OWNER TO app_codex;
+        GRANT app_codex TO migrator;
+        SET ROLE migrator;
+      `);
+      await migrate();
+      await db.exec("RESET ROLE");
+      expect(await constraints()).toEqual(EXPECTED_CONSTRAINTS);
+      expect(await indexes()).toEqual(EXPECTED_INDEXES);
+    });
+
+    it("fails the repair when the migrator can read codex but owns none of it", async () => {
+      await db.exec("CREATE ROLE migrator LOGIN");
+      await db.exec(LEGACY_SCHEMA);
+      await db.exec(
+        `GRANT USAGE ON SCHEMA codex TO migrator;
+         GRANT SELECT ON ALL TABLES IN SCHEMA codex TO migrator;
+         SET ROLE migrator;`,
+      );
+      await expect(migrate()).rejects.toThrow(/must be owner of table/);
+    });
   });
 });

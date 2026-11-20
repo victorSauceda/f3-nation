@@ -35,6 +35,8 @@ interface FakeDbOptions {
   };
   roles?: string[];
   alembic?: "found" | "missing";
+  // A statement containing this text rejects, to drive a mid-reset failure.
+  failOn?: string;
 }
 
 // A db whose execute() answers the two read queries from canned data and
@@ -43,11 +45,14 @@ const fakeDb = ({
   connected = { current_database: "f3nation_test", disposable_marker: null },
   roles = [],
   alembic = "found",
+  failOn,
 }: FakeDbOptions = {}) => {
   const statements: string[] = [];
   const execute = vi.fn((q: unknown) => {
     const text = render(q);
     statements.push(text);
+    if (failOn && text.includes(failOn))
+      return Promise.reject(new Error(`boom: ${failOn}`));
     if (text.includes("current_database()"))
       return Promise.resolve([connected]);
     if (text.includes("FROM pg_roles")) {
@@ -60,7 +65,25 @@ const fakeDb = ({
       ? Promise.resolve([{ versionNum: "abc123" }])
       : Promise.reject(new Error("relation does not exist")),
   );
-  const db = { execute, select: () => ({ from }) } as unknown as AppDb;
+  // Records the transaction boundary so a test can tell a rolled-back reset
+  // from a committed one.
+  const transaction = vi.fn(
+    async (fn: (tx: { execute: typeof execute }) => Promise<void>) => {
+      statements.push("BEGIN");
+      try {
+        await fn({ execute });
+        statements.push("COMMIT");
+      } catch (e) {
+        statements.push("ROLLBACK");
+        throw e;
+      }
+    },
+  );
+  const db = {
+    execute,
+    transaction,
+    select: () => ({ from }),
+  } as unknown as AppDb;
   const drops = () =>
     statements
       .filter((s) => s.startsWith("DROP SCHEMA"))
@@ -133,6 +156,32 @@ describe("reset", () => {
         "DROP SCHEMA IF EXISTS audit CASCADE",
       );
       expect(statements[auditDrop + 1]).toBe("CREATE SCHEMA public");
+    });
+
+    it("runs every drop, the public recreate and the grants in one transaction", async () => {
+      const { db, statements } = fakeDb({ roles: ["app_api"] });
+      await reset(db);
+      const begin = statements.indexOf("BEGIN");
+      const commit = statements.indexOf("COMMIT");
+      const firstDrop = statements.findIndex((s) =>
+        s.startsWith("DROP SCHEMA"),
+      );
+      const lastGrant = statements.findIndex((s) => s.includes("GRANT USAGE"));
+      expect(begin).toBeGreaterThanOrEqual(0);
+      expect(begin).toBeLessThan(firstDrop);
+      expect(lastGrant).toBeLessThan(commit);
+      expect(statements).not.toContain("ROLLBACK");
+    });
+
+    it("rolls back instead of committing when a later drop fails after codex was dropped", async () => {
+      const { db, statements } = fakeDb({
+        failOn: "DROP SCHEMA IF EXISTS auth",
+      });
+      await expect(reset(db)).rejects.toThrow(/boom/);
+      expect(statements).toContain("DROP SCHEMA IF EXISTS codex CASCADE");
+      expect(statements).toContain("ROLLBACK");
+      expect(statements).not.toContain("COMMIT");
+      expect(statements).not.toContain("CREATE SCHEMA public");
     });
 
     it("re-grants public to every non-system role it found before dropping", async () => {

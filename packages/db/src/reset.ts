@@ -92,32 +92,34 @@ export const reset = async (db?: AppDb) => {
     WHERE rolname NOT IN ('postgres', 'azure_pg_admin', 'azure_superuser', 'cloudsqlsuperuser')
   `);
 
-  // codex is bootstrapped by migration 0038; drop it too so local/test resets
-  // start clean and 0038 recreates it instead of skipping surviving tables.
-  // It goes FIRST: in an environment where codex is externally owned (prod
-  // layout) this is the drop most likely to be denied, and failing here
-  // leaves public/drizzle/auth untouched instead of half-reset.
-  await dbToUse.execute(sql`DROP SCHEMA IF EXISTS codex CASCADE`);
-  await dbToUse.execute(sql`DROP SCHEMA IF EXISTS public CASCADE`);
-  await dbToUse.execute(sql`DROP SCHEMA IF EXISTS drizzle CASCADE`);
-  await dbToUse.execute(sql`DROP SCHEMA IF EXISTS auth CASCADE`);
-  await dbToUse.execute(sql`DROP SCHEMA IF EXISTS slackbot CASCADE`);
-  // Reset intentionally destroys the local/test dataset, including its history.
-  // Operational disablement uses audit.disable_tracking and preserves history.
-  await dbToUse.execute(sql`DROP SCHEMA IF EXISTS public_history CASCADE`);
-  await dbToUse.execute(sql`DROP SCHEMA IF EXISTS audit CASCADE`);
-  await dbToUse.execute(sql`CREATE SCHEMA public`);
+  // Every destructive step runs in one transaction so a denied or failed drop
+  // rolls the whole reset back instead of leaving the database without its
+  // schemas. codex is bootstrapped by migration 0038; it is dropped too so
+  // local/test resets start clean and 0038 recreates it instead of skipping
+  // surviving tables.
+  await dbToUse.transaction(async (tx) => {
+    await tx.execute(sql`DROP SCHEMA IF EXISTS codex CASCADE`);
+    await tx.execute(sql`DROP SCHEMA IF EXISTS public CASCADE`);
+    await tx.execute(sql`DROP SCHEMA IF EXISTS drizzle CASCADE`);
+    await tx.execute(sql`DROP SCHEMA IF EXISTS auth CASCADE`);
+    await tx.execute(sql`DROP SCHEMA IF EXISTS slackbot CASCADE`);
+    // Reset intentionally destroys the local/test dataset, including its history.
+    // Operational disablement uses audit.disable_tracking and preserves history.
+    await tx.execute(sql`DROP SCHEMA IF EXISTS public_history CASCADE`);
+    await tx.execute(sql`DROP SCHEMA IF EXISTS audit CASCADE`);
+    await tx.execute(sql`CREATE SCHEMA public`);
 
-  for (const user of users) {
-    const quotedRolname = `"${user.rolname}"`;
-    await dbToUse.execute(sql`
-      GRANT USAGE ON SCHEMA public TO ${sql.raw(quotedRolname)};
-      GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ${sql.raw(quotedRolname)};
-      GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO ${sql.raw(quotedRolname)};
-      ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON TABLES TO ${sql.raw(quotedRolname)};
-      ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON SEQUENCES TO ${sql.raw(quotedRolname)};
-    `);
-  }
+    for (const user of users) {
+      const quotedRolname = `"${user.rolname}"`;
+      await tx.execute(sql`
+        GRANT USAGE ON SCHEMA public TO ${sql.raw(quotedRolname)};
+        GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ${sql.raw(quotedRolname)};
+        GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO ${sql.raw(quotedRolname)};
+        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON TABLES TO ${sql.raw(quotedRolname)};
+        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON SEQUENCES TO ${sql.raw(quotedRolname)};
+      `);
+    }
+  });
 
   return;
 };

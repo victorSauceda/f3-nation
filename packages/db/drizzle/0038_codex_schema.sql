@@ -1,23 +1,34 @@
 -- `codex` mirrors the standalone Codex database's schema. Its tables are owned
 -- by the app_codex role, not by the role that runs migrations, and a database
 -- can be in one of three states when this runs:
---   * codex absent (fresh dev/CI/test): the first block creates the schema,
---     tables, indexes and constraints. Needs CREATE on the database.
+--   * codex absent (fresh dev/CI/test, or a database never provisioned from the
+--     Codex dump): the first block creates the schema, tables, indexes and
+--     constraints, then hands ownership of the schema and tables to app_codex
+--     when that role exists, matching how prod owns them. That needs CREATE on
+--     the database, membership in app_codex for the migration role, and CREATE
+--     on the database for app_codex (a schema owner must hold it). Other roles
+--     reach the new tables through default privileges, like any other object a
+--     migration creates (docs/db-migrations.md, "Database roles"). Without an
+--     app_codex role the migration role keeps ownership.
 --   * codex present but missing a constraint or index (a database provisioned
 --     from the Codex dump): the second block adds what is missing. ALTER TABLE
 --     and CREATE INDEX need ownership of the codex tables, which the migration
---     role holds through membership in app_codex (docs/db-migrations.md,
---     "Database roles"). Missing tables are never created here: a table created
---     by the migration role would lack the grants the Codex app relies on, so
---     the block raises and names them instead.
+--     role holds through membership in app_codex. Missing tables are never
+--     created here: a table created by the migration role would lack the grants
+--     the Codex app relies on, so the block raises and names them instead. An
+--     existing constraint or index that has the expected name but a different
+--     column list, type or table is also an error, never a pass.
 --   * codex fully provisioned (prod): catalog reads only; no DDL runs.
 -- Postgres checks privileges before the IF NOT EXISTS short-circuit for
 -- CREATE SCHEMA and CREATE INDEX, so every statement is guarded by a catalog
--- lookup (pg_namespace, pg_class, pg_constraint, to_regclass) rather than by
+-- lookup (pg_namespace, pg_class, pg_constraint, pg_index) rather than by
 -- IF NOT EXISTS. The last block verifies, and never alters, that every key
--- audit history depends on is present with the right constraint type, so the
--- migration can never be recorded as applied against a schema that lacks one.
+-- audit history depends on is present with the right constraint type and
+-- columns, and that both lookup indexes are valid, so the migration can never
+-- be recorded as applied against a schema that lacks one.
 DO $$
+DECLARE
+	tbl text;
 BEGIN
 	IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'codex') THEN
 		RETURN;
@@ -85,12 +96,23 @@ BEGIN
 	);
 	CREATE INDEX "idx_entry_references_target_entry_id" ON "codex"."entry_references" USING btree ("target_entry_id");
 	CREATE INDEX "idx_entry_tags_tag_id" ON "codex"."entry_tags" USING btree ("tag_id");
+
+	IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_codex') THEN
+		IF NOT pg_has_role(current_user, 'app_codex', 'MEMBER') THEN
+			RAISE EXCEPTION 'role app_codex exists but % is not a member of it, so the new codex schema cannot be handed to it. Run GRANT app_codex TO % as an administrator and rerun.', current_user, current_user;
+		END IF;
+		ALTER SCHEMA "codex" OWNER TO "app_codex";
+		FOREACH tbl IN ARRAY ARRAY['admins', 'entries', 'entry_references', 'entry_tags', 'references', 'tags', 'user_submissions'] LOOP
+			EXECUTE format('ALTER TABLE codex.%I OWNER TO app_codex', tbl);
+		END LOOP;
+	END IF;
 END $$;
 --> statement-breakpoint
 DO $$
 DECLARE
 	missing text;
 	spec record;
+	existing_cols text[];
 	existing text;
 	columns text;
 	bad bigint;
@@ -127,14 +149,28 @@ BEGIN
 			('user_submissions', 'user_submissions_pkey', 'p', ARRAY['id'])
 		) AS v(tbl, conname, contype, cols)
 	LOOP
+		existing := NULL;
+		existing_cols := NULL;
 		IF spec.contype = 'p' THEN
-			SELECT c.conname INTO existing FROM pg_constraint c
+			SELECT c.conname, (
+				SELECT array_agg(a.attname::text ORDER BY k.ord)
+				FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+				JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+			) INTO existing, existing_cols FROM pg_constraint c
 			WHERE c.conrelid = format('codex.%I', spec.tbl)::regclass AND c.contype = 'p';
 		ELSE
-			SELECT c.conname INTO existing FROM pg_constraint c
+			SELECT c.conname, (
+				SELECT array_agg(a.attname::text ORDER BY k.ord)
+				FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+				JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+			) INTO existing, existing_cols FROM pg_constraint c
 			WHERE c.conrelid = format('codex.%I', spec.tbl)::regclass AND c.contype = 'u' AND c.conname = spec.conname;
 		END IF;
 		IF existing = spec.conname THEN
+			IF existing_cols IS DISTINCT FROM spec.cols THEN
+				RAISE EXCEPTION 'codex.%: constraint % covers (%) but migration 0038 expects (%). Drop it as the schema owner and rerun.',
+					spec.tbl, existing, array_to_string(existing_cols, ', '), array_to_string(spec.cols, ', ');
+			END IF;
 			CONTINUE;
 		END IF;
 		IF existing IS NOT NULL THEN
@@ -169,21 +205,47 @@ BEGIN
 		END IF;
 	END LOOP;
 
-	-- A UNIQUE (entry_id, tag_id) duplicates entry_tags_pkey (Postgres will not
-	-- create one beside an identical primary key on a fresh table), and the
-	-- Codex app's ON CONFLICT (entry_id, tag_id) infers the primary key index,
-	-- so drop it once the primary key is in place.
+	-- A UNIQUE (entry_id, tag_id) duplicates entry_tags_pkey: a second, identical
+	-- index to maintain. The Codex app's ON CONFLICT (entry_id, tag_id) is
+	-- satisfied by the primary key index alone, so drop the unique constraint
+	-- once the primary key is in place.
 	IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'codex.entry_tags'::regclass AND conname = 'entry_tags_pkey' AND contype = 'p')
 	   AND EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'codex.entry_tags'::regclass AND conname = 'unique_entry_tag' AND contype = 'u') THEN
 		ALTER TABLE codex.entry_tags DROP CONSTRAINT unique_entry_tag;
 	END IF;
 
-	IF to_regclass('codex.idx_entry_references_target_entry_id') IS NULL THEN
-		CREATE INDEX "idx_entry_references_target_entry_id" ON "codex"."entry_references" USING btree ("target_entry_id");
-	END IF;
-	IF to_regclass('codex.idx_entry_tags_tag_id') IS NULL THEN
-		CREATE INDEX "idx_entry_tags_tag_id" ON "codex"."entry_tags" USING btree ("tag_id");
-	END IF;
+	-- An index is only accepted when the named relation is a valid, plain
+	-- single-column btree index on the expected table and column; any other
+	-- relation holding the name is an error, never a pass.
+	FOR spec IN
+		SELECT * FROM (VALUES
+			('idx_entry_references_target_entry_id', 'entry_references', 'target_entry_id'),
+			('idx_entry_tags_tag_id', 'entry_tags', 'tag_id')
+		) AS v(idx, tbl, col)
+	LOOP
+		IF EXISTS (
+			SELECT 1 FROM pg_index i
+			JOIN pg_class ic ON ic.oid = i.indexrelid
+			JOIN pg_class tc ON tc.oid = i.indrelid
+			JOIN pg_attribute a ON a.attrelid = tc.oid AND a.attnum = i.indkey[0]
+			WHERE ic.relnamespace = 'codex'::regnamespace
+			  AND tc.relnamespace = 'codex'::regnamespace
+			  AND ic.relname = spec.idx AND tc.relname = spec.tbl
+			  AND ic.relam = (SELECT oid FROM pg_am WHERE amname = 'btree')
+			  AND i.indnatts = 1 AND i.indpred IS NULL AND i.indisvalid
+			  AND a.attname = spec.col
+		) THEN
+			CONTINUE;
+		END IF;
+		IF EXISTS (
+			SELECT 1 FROM pg_class c
+			WHERE c.relnamespace = 'codex'::regnamespace AND c.relname = spec.idx
+		) THEN
+			RAISE EXCEPTION 'codex.% exists but is not a valid btree index on codex.%(%). Drop or rename it as the schema owner and rerun.',
+				spec.idx, spec.tbl, spec.col;
+		END IF;
+		EXECUTE format('CREATE INDEX %I ON codex.%I USING btree (%I)', spec.idx, spec.tbl, spec.col);
+	END LOOP;
 END $$;
 --> statement-breakpoint
 DO $$
@@ -191,22 +253,23 @@ DECLARE
 	missing text;
 BEGIN
 	-- Verify (never alter) that every constraint the snapshot declares exists
-	-- with the expected type: a same-named CHECK or foreign key must not pass.
-	-- pg_constraint is readable without table privileges.
+	-- with the expected type and ordered columns: a same-named CHECK, foreign
+	-- key or key over other columns must not pass. pg_constraint is readable
+	-- without table privileges.
 	SELECT string_agg(expected.conname, ', ' ORDER BY expected.conname)
 	INTO missing
 	FROM (VALUES
-		('admins', 'admins_pkey', 'p'),
-		('admins', 'admins_email_unique', 'u'),
-		('entries', 'entries_pkey', 'p'),
-		('entry_references', 'entry_references_pkey', 'p'),
-		('entry_references', 'unique_source_target', 'u'),
-		('entry_tags', 'entry_tags_pkey', 'p'),
-		('references', 'references_pkey', 'p'),
-		('tags', 'tags_pkey', 'p'),
-		('tags', 'tags_name_unique', 'u'),
-		('user_submissions', 'user_submissions_pkey', 'p')
-	) AS expected(tbl, conname, contype)
+		('admins', 'admins_pkey', 'p', ARRAY['id']),
+		('admins', 'admins_email_unique', 'u', ARRAY['email']),
+		('entries', 'entries_pkey', 'p', ARRAY['id']),
+		('entry_references', 'entry_references_pkey', 'p', ARRAY['id']),
+		('entry_references', 'unique_source_target', 'u', ARRAY['source_entry_id', 'target_entry_id']),
+		('entry_tags', 'entry_tags_pkey', 'p', ARRAY['entry_id', 'tag_id']),
+		('references', 'references_pkey', 'p', ARRAY['id']),
+		('tags', 'tags_pkey', 'p', ARRAY['id']),
+		('tags', 'tags_name_unique', 'u', ARRAY['name']),
+		('user_submissions', 'user_submissions_pkey', 'p', ARRAY['id'])
+	) AS expected(tbl, conname, contype, cols)
 	WHERE NOT EXISTS (
 		SELECT 1 FROM pg_constraint c
 		JOIN pg_class r ON r.oid = c.conrelid
@@ -214,12 +277,35 @@ BEGIN
 		  AND r.relname = expected.tbl
 		  AND c.conname = expected.conname
 		  AND c.contype = expected.contype
+		  AND (
+			SELECT array_agg(a.attname::text ORDER BY k.ord)
+			FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+			JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+		  ) = expected.cols
 	);
 	IF missing IS NOT NULL THEN
 		RAISE EXCEPTION 'codex schema is missing constraints required by migration 0038: %', missing;
 	END IF;
-	IF to_regclass('codex.idx_entry_references_target_entry_id') IS NULL
-	   OR to_regclass('codex.idx_entry_tags_tag_id') IS NULL THEN
-		RAISE EXCEPTION 'codex schema is missing an index required by migration 0038 (idx_entry_references_target_entry_id, idx_entry_tags_tag_id)';
+
+	SELECT string_agg(expected.idx, ', ' ORDER BY expected.idx)
+	INTO missing
+	FROM (VALUES
+		('idx_entry_references_target_entry_id', 'entry_references', 'target_entry_id'),
+		('idx_entry_tags_tag_id', 'entry_tags', 'tag_id')
+	) AS expected(idx, tbl, col)
+	WHERE NOT EXISTS (
+		SELECT 1 FROM pg_index i
+		JOIN pg_class ic ON ic.oid = i.indexrelid
+		JOIN pg_class tc ON tc.oid = i.indrelid
+		JOIN pg_attribute a ON a.attrelid = tc.oid AND a.attnum = i.indkey[0]
+		WHERE ic.relnamespace = 'codex'::regnamespace
+		  AND tc.relnamespace = 'codex'::regnamespace
+		  AND ic.relname = expected.idx AND tc.relname = expected.tbl
+		  AND ic.relam = (SELECT oid FROM pg_am WHERE amname = 'btree')
+		  AND i.indnatts = 1 AND i.indpred IS NULL AND i.indisvalid
+		  AND a.attname = expected.col
+	);
+	IF missing IS NOT NULL THEN
+		RAISE EXCEPTION 'codex schema is missing indexes required by migration 0038: %', missing;
 	END IF;
 END $$;

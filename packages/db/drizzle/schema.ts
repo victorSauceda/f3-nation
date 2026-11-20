@@ -1868,9 +1868,9 @@ export const codexEntryTags = codexSchema.table(
     tagId: text("tag_id").notNull(),
   },
   (t) => [
-    // No UNIQUE (entry_id, tag_id) beside this PK: Postgres refuses to create
-    // one that duplicates an identical primary key, and the app's
-    // ON CONFLICT (entry_id, tag_id) infers the primary key index.
+    // No UNIQUE (entry_id, tag_id) beside this PK: it would only add a second,
+    // identical index to maintain, and the app's ON CONFLICT (entry_id, tag_id)
+    // is satisfied by the primary key index alone.
     primaryKey({ name: "entry_tags_pkey", columns: [t.entryId, t.tagId] }),
     index("idx_entry_tags_tag_id").on(t.tagId),
   ],

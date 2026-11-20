@@ -160,20 +160,20 @@ FROM (
     CASE c.relkind WHEN 'S' THEN 'sequence' WHEN 'v' THEN 'view'
       WHEN 'm' THEN 'materialized view' ELSE 'table' END AS kind
   FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-  WHERE n.nspname IN ('public', 'auth', 'slackbot', 'drizzle')
+  WHERE n.nspname IN ('public', 'auth', 'slackbot', 'drizzle', 'codex')
     AND c.relkind IN ('r', 'p', 'v', 'm', 'S')
   UNION ALL
   SELECT t.typowner, t.oid, 'pg_type'::regclass, 'type'
   FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
-  WHERE n.nspname IN ('public', 'auth', 'slackbot', 'drizzle')
+  WHERE n.nspname IN ('public', 'auth', 'slackbot', 'drizzle', 'codex')
     AND t.typtype IN ('e', 'd', 'c', 'r', 'm') AND t.typrelid = 0
   UNION ALL
   SELECT p.proowner, p.oid, 'pg_proc'::regclass, 'function'
   FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-  WHERE n.nspname IN ('public', 'auth', 'slackbot', 'drizzle')
+  WHERE n.nspname IN ('public', 'auth', 'slackbot', 'drizzle', 'codex')
   UNION ALL
   SELECT nspowner, oid, 'pg_namespace'::regclass, 'schema'
-  FROM pg_namespace WHERE nspname IN ('public', 'auth', 'slackbot', 'drizzle')
+  FROM pg_namespace WHERE nspname IN ('public', 'auth', 'slackbot', 'drizzle', 'codex')
 ) o
 WHERE NOT EXISTS (SELECT 1 FROM pg_depend d   -- skip extension objects (citext)
   WHERE d.classid = o.cls AND d.objid = o.oid AND d.deptype = 'e')
